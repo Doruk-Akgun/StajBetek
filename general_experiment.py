@@ -279,14 +279,31 @@ def run_mode(mode, user_question, collection, parent_collection, bm25_index):
 
 
 def answer_with_context(user_question, context):
-    system_prompt = f"""You are an assistant that analyzes academic papers.
-Answer the user's question using ONLY the source excerpts provided below.
-Indicate which page(s) the information came from.
-If the answer is not in the sources, say "This information is not found in the provided excerpts." Do not make anything up.
+    system_prompt = f"""You are an assistant that answers questions about academic papers.
+
+Use ONLY the provided source excerpts.
+
+Rules:
+1. Never use outside knowledge.
+2. If the answer is not in the excerpts, say:
+   "This information is not found in the provided excerpts."
+3. Always cite the page number(s).
+4. When the excerpts contain a table:
+   - Read rows and columns carefully.
+   - Do not combine values from different rows or different tables.
+   - If answering from a table, identify the matching row before answering.
+5. If multiple excerpts contain similar tables, use the table that directly answers the question.
+6. Think carefully before answering, but output only the final answer.
+"""
+    user_prompt = f"""
+Question:
+{user_question}
 
 SOURCE EXCERPTS:
-{context}"""
-    return ask_llm(system_prompt=system_prompt, user_prompt=user_question)
+{context}
+"""
+
+    return ask_llm(system_prompt=system_prompt, user_prompt=user_prompt)
 
 
 # ---------------------------------------------------------
