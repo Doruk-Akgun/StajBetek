@@ -128,7 +128,7 @@ def chunk_text_parent_child(pages):
 
 
 # ---------------------------------------------------------
-# 4c. Tokenizer for BM25 (simple, dependency-free)
+# 4c. Tokenizer for BM25 (simple, dependency-free)aaaa
 # ---------------------------------------------------------
 def tokenize(text):
     return re.findall(r"[a-z0-9]+", text.lower())

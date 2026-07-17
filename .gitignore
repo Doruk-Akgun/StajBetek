@@ -1,0 +1,18 @@
+# Test files
+evaltests/
+
+# Local database folders
+experimental_hybrid_search_db/
+experimental_rag_db/
+general_experiment/
+
+# Large PDF files
+16.pdf
+20.pdf
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Environment files
+.env
