@@ -175,12 +175,13 @@ def semantic_search(user_question, collection, final_n=FINAL_TOP_K):
     results = collection.query(
         query_embeddings=[query_vector],
         n_results=final_n,
-        include=["documents", "metadatas"],
+        include=["documents", "metadatas", "distances"],
     )
     ids = results["ids"][0]
     documents = results["documents"][0]
     metadatas = results["metadatas"][0]
-    return [{"id": i, "text": d, "metadata": m} for i, d, m in zip(ids, documents, metadatas)]
+    distances = results["distances"][0]
+    return [{"id": i, "text": d, "metadata": m, "distance": dist} for i, d, m, dist in zip(ids, documents, metadatas, distances)]
 
 
 # ---------------------------------------------------------
@@ -193,9 +194,11 @@ def hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K):
     vector_results = collection.query(
         query_embeddings=[query_vector],
         n_results=VECTOR_TOP_K,
-        include=["metadatas"],
+        include=["metadatas", "distances"],
     )
-    vector_ranked_ids = vector_results["ids"][0]
+    vector_ids = vector_results["ids"][0]
+    vector_distances = vector_results["distances"][0]
+    vector_ranked_ids = vector_ids  # no filtering, just ranking as before
 
     # --- BM25 (sparse/keyword) search ---
     tokenized_query = tokenize(user_question)
@@ -209,11 +212,19 @@ def hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K):
     fused_ids = reciprocal_rank_fusion([vector_ranked_ids, bm25_ranked_ids])
     top_ids = fused_ids[:final_n]
 
-    # Resolve text + metadata for the fused top ids via a lookup
-    # (don't rely on Chroma's .get() id ordering).
+    # Build lookup dicts so we can attach scores to the final records
+    dense_score_map = dict(zip(vector_ids, vector_distances))
+    sparse_score_map = {bm25_index["ids"][i]: bm25_scores[i] for i in ranked_indices}
+
     fetched = collection.get(ids=top_ids, include=["documents", "metadatas"])
     id_to_record = {
-        doc_id: {"id": doc_id, "text": doc, "metadata": meta}
+        doc_id: {
+            "id": doc_id,
+            "text": doc,
+            "metadata": meta,
+            "dense_distance": dense_score_map.get(doc_id),
+            "sparse_score": sparse_score_map.get(doc_id),
+        }
         for doc_id, doc, meta in zip(fetched["ids"], fetched["documents"], fetched["metadatas"])
     }
 
