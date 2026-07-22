@@ -5,6 +5,8 @@ evaltests/
 experimental_hybrid_search_db/
 experimental_rag_db/
 general_experiment/
+general_exp/
+dataset/
 
 # Large PDF files
 16.pdf
