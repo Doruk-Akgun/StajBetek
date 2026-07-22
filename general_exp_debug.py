@@ -13,9 +13,9 @@ from rank_bm25 import BM25Okapi
 # 0. Settings
 # ---------------------------------------------------------
 LM_STUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
-PDF_PATH = "16.pdf"
+PDF_FILES = ["16.pdf", "20.pdf"]   
 CHROMA_DB_PATH = "./general_experiment"
-COLLECTION_NAME = "academic_paper_2"
+COLLECTION_NAME = "academic_paper_4"
 
 PARENT_CHUNK_SIZE = 2000
 PARENT_OVERLAP = 200
@@ -101,7 +101,7 @@ def split_into_pieces(text, chunk_size, overlap):
 # ---------------------------------------------------------
 # 4b. Parent-child chunking
 # ---------------------------------------------------------
-def chunk_text_parent_child(pages):
+def chunk_text_parent_child(pages, doc_id):
     parent_chunks = []
     child_chunks = []
 
@@ -109,7 +109,7 @@ def chunk_text_parent_child(pages):
     for page in pages:
         parent_pieces = split_into_pieces(page["text"], PARENT_CHUNK_SIZE, PARENT_OVERLAP)
         for parent_text in parent_pieces:
-            parent_id = f"parent_{parent_counter}"
+            parent_id = f"{doc_id}_parent_{parent_counter}"
             parent_counter += 1
             parent_chunks.append(
                 {"parent_id": parent_id, "text": parent_text, "page_number": page["page_number"]}
@@ -125,6 +125,51 @@ def chunk_text_parent_child(pages):
                 )
 
     return parent_chunks, child_chunks
+
+
+# ---------------------------------------------------------
+# 4b-2. Ingest a single PDF into an existing (possibly non-empty) collection.
+#     Safe to call multiple times with different files: parent/child ids
+#     are namespaced with doc_id so they won't collide with earlier files.
+# ---------------------------------------------------------
+def ingest_pdf(pdf_path, collection, parent_collection):
+    doc_id = os.path.splitext(os.path.basename(pdf_path))[0]
+
+    print(f"   Reading '{pdf_path}'...")
+    pages = extract_pdf_text(pdf_path)
+    print(f"   Extracted text from {len(pages)} pages.")
+
+    parent_chunks, child_chunks = chunk_text_parent_child(pages, doc_id)
+    print(f"   Created {len(parent_chunks)} parent chunks and {len(child_chunks)} child chunks.")
+
+    for parent in parent_chunks:
+        parent_collection.add(
+            embeddings=[[0.0]],
+            documents=[parent["text"]],
+            metadatas=[{"source": pdf_path, "page_number": parent["page_number"]}],
+            ids=[parent["parent_id"]],
+        )
+
+    for i, child in enumerate(child_chunks):
+        vector = get_embedding(child["text"])
+        child_id = f"{doc_id}_child_{i}"
+        collection.add(
+            embeddings=[vector],
+            documents=[child["text"]],
+            metadatas=[{
+                "source": pdf_path,
+                "page_number": child["page_number"],
+                "child_id": child_id,
+                "parent_id": child["parent_id"],
+                "chunk_index_in_page": child["chunk_index_in_page"],
+                "chunk_length": child["chunk_length"],
+            }],
+            ids=[child_id],
+        )
+        if (i + 1) % 5 == 0 or (i + 1) == len(child_chunks):
+            print(f"   [{i + 1}/{len(child_chunks)}] child chunks processed.")
+
+    print(f"   Finished ingesting '{pdf_path}': {len(parent_chunks)} parents, {len(child_chunks)} children.\n")
 
 
 # ---------------------------------------------------------
@@ -240,7 +285,14 @@ def build_context(records):
     context = "\n\n".join(f"(Page {r['metadata']['page_number']}): {r['text']}" for r in records)
     for i, r in enumerate(records):
         print(f"\n===== Chunk {i+1} =====")
+        print(f"Source: {r['metadata']['source']}")
         print(f"Page: {r['metadata']['page_number']}")
+        if "distance" in r:
+            print(f"Dense distance: {r['distance']:.4f}")
+        if r.get("dense_distance") is not None:
+            print(f"Dense distance: {r['dense_distance']:.4f}")
+        if r.get("sparse_score") is not None:
+            print(f"Sparse score: {r['sparse_score']:.4f}")
         print(r["text"])
     return context, pages
 
@@ -327,51 +379,22 @@ SOURCE EXCERPTS:
 def main():
     print("Step 1: Setting up Chroma DB...")
     chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-    collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+    collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
     parent_collection = chroma_client.get_or_create_collection(name=f"{COLLECTION_NAME}_parents")
 
     existing_count = collection.count()
-    if existing_count > 0:
-        print(f"   Collection already has {existing_count} child chunks — skipping PDF reading, chunking, and embedding.\n")
-    else:
-        print("   Collection is empty.\n")
+    print(f"   Collection currently has {existing_count} child chunks.\n")
 
-        print(f"Step 2: Reading '{PDF_PATH}'...")
-        pages = extract_pdf_text(PDF_PATH)
-        print(f"   Extracted text from {len(pages)} pages.\n")
+    print("Step 2: Checking which files still need to be ingested...")
+    for pdf_path in PDF_FILES:
+        already_ingested = collection.get(where={"source": pdf_path}, limit=1)["ids"]
+        if already_ingested:
+            print(f"   '{pdf_path}' already ingested — skipping.")
+        else:
+            print(f"   '{pdf_path}' not found in collection — ingesting now...")
+            ingest_pdf(pdf_path, collection, parent_collection)
 
-        print("Step 3: Splitting text into parent and child chunks...")
-        parent_chunks, child_chunks = chunk_text_parent_child(pages)
-        print(f"   Created {len(parent_chunks)} parent chunks and {len(child_chunks)} child chunks.\n")
-
-        print("Step 4a: Storing parent chunks (text only, no embedding needed)...")
-        for parent in parent_chunks:
-            parent_collection.add(
-                embeddings=[[0.0]],
-                documents=[parent["text"]],
-                metadatas=[{"source": PDF_PATH, "page_number": parent["page_number"]}],
-                ids=[parent["parent_id"]],
-            )
-        print(f"   Stored {parent_collection.count()} parent chunks.\n")
-
-        print("Step 4b: Embedding and storing child chunks...")
-        for i, child in enumerate(child_chunks):
-            vector = get_embedding(child["text"])
-            collection.add(
-                embeddings=[vector],
-                documents=[child["text"]],
-                metadatas=[{
-                    "source": PDF_PATH,
-                    "page_number": child["page_number"],
-                    "parent_id": child["parent_id"],
-                    "chunk_index_in_page": child["chunk_index_in_page"], 
-                    "chunk_length": child["chunk_length"]
-                }],
-                ids=[f"{COLLECTION_NAME}_child_{i}"],
-            )
-            if (i + 1) % 5 == 0 or (i + 1) == len(child_chunks):
-                print(f"   [{i + 1}/{len(child_chunks)}] child chunks processed.")
-        print(f"\nStored {collection.count()} child chunks in the '{COLLECTION_NAME}' collection.\n")
+    print(f"Collection now has {collection.count()} child chunks and {parent_collection.count()} parent chunks in '{COLLECTION_NAME}'.\n")
 
     print("Step 5: Building BM25 keyword index over child chunks...")
     bm25_index = build_bm25_index(collection)
