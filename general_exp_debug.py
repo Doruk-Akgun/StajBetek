@@ -15,7 +15,7 @@ from rank_bm25 import BM25Okapi
 LM_STUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
 PDF_FILES = ["16.pdf", "20.pdf"]   
 CHROMA_DB_PATH = "./general_experiment"
-COLLECTION_NAME = "academic_paper_4"
+COLLECTION_NAME = "academic_paper_3"
 
 PARENT_CHUNK_SIZE = 2000
 PARENT_OVERLAP = 200

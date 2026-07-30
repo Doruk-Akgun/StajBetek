@@ -7,6 +7,7 @@ experimental_rag_db/
 general_experiment/
 general_exp/
 dataset/
+paint_db/
 
 # Large PDF files
 16.pdf
