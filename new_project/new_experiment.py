@@ -7,6 +7,7 @@ import requests
 from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
 from pdf_reading_order import extract_pdf_text
+from pdf_extraction import extract_paint_properties
 
 
 # ---------------------------------------------------------
@@ -26,6 +27,10 @@ PDF_PATHS = [os.path.join(DATASET_PATH, file) for file in PDF_FILES]
 
 CHROMA_DB_PATH = "./paint_db"
 COLLECTION_NAME = "test1"
+
+# Structured properties extracted per document during ingestion, keyed by
+# doc_id (filled in by ingest_pdf via extract_paint_properties(pages)).
+PAINT_PROPERTIES = {}
 
 PARENT_CHUNK_SIZE = 1024
 PARENT_OVERLAP = 128
@@ -127,6 +132,29 @@ def chunk_text_parent_child(pages, doc_id):
 
 
 # ---------------------------------------------------------
+# 4a-2. Flatten the structured `properties` dict (from extract_paint_properties)
+#     into a Chroma-safe metadata dict, prefixed with "prop_" so it can't
+#     collide with the existing metadata keys (source, page_number, ...).
+#     Chroma metadata values must be str/int/float/bool -- lists are
+#     joined into a comma-separated string, and None/empty values are
+#     dropped entirely rather than stored as "None". The full dict is
+#     also kept as one JSON string (properties_json) so nothing is lost
+#     even for fields that don't round-trip cleanly through flattening.
+# ---------------------------------------------------------
+def properties_to_metadata(properties):
+    meta = {"properties_json": json.dumps(properties, ensure_ascii=False)}
+    for key, value in properties.items():
+        if value is None or value == [] or value == "":
+            continue
+        if isinstance(value, list):
+            value = ", ".join(str(v) for v in value)
+        elif not isinstance(value, (str, int, float, bool)):
+            value = str(value)
+        meta[f"prop_{key}"] = value
+    return meta
+
+
+# ---------------------------------------------------------
 # 4b-2. Ingest a single PDF into an existing (possibly non-empty) collection.
 #     Safe to call multiple times with different files: parent/child ids
 #     are namespaced with doc_id so they won't collide with earlier files.
@@ -138,6 +166,18 @@ def ingest_pdf(pdf_path, collection, parent_collection, pdf_file):
     pages = extract_pdf_text(pdf_path)
     print(f"   Extracted text from {len(pages)} pages.")
 
+    # extract_paint_properties takes the `pages` list itself (the output
+    # of extract_pdf_text above), never the raw pdf_path.
+    properties = extract_paint_properties(pages)
+    PAINT_PROPERTIES[doc_id] = properties
+    print(f"   Extracted paint properties for '{doc_id}':")
+
+    # Flatten once per document; every parent AND child chunk below gets
+    # this same dict merged into its metadata, so the structured info
+    # travels with each cluster of chunks for this product and is reachable
+    # from parent chunks too (not just stashed in a separate record).
+    properties_meta = properties_to_metadata(properties)
+
     parent_chunks, child_chunks = chunk_text_parent_child(pages, doc_id)
     print(f"   Created {len(parent_chunks)} parent chunks and {len(child_chunks)} child chunks.")
 
@@ -145,7 +185,11 @@ def ingest_pdf(pdf_path, collection, parent_collection, pdf_file):
         parent_collection.add(
             embeddings=[[0.0]],
             documents=[parent["text"]],
-            metadatas=[{"source": pdf_file, "page_number": parent["page_number"]}],
+            metadatas=[{
+                "source": pdf_file,
+                "page_number": parent["page_number"],
+                **properties_meta,
+            }],
             ids=[parent["parent_id"]],
         )
 
@@ -162,6 +206,7 @@ def ingest_pdf(pdf_path, collection, parent_collection, pdf_file):
                 "parent_id": child["parent_id"],
                 "chunk_index_in_page": child["chunk_index_in_page"],
                 "chunk_length": child["chunk_length"],
+                **properties_meta,
             }],
             ids=[child_id],
         )
