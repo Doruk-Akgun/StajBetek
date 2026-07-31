@@ -124,70 +124,68 @@ def extract_paint_properties(pdf_path):
  
     # --- Product name (strip trademark symbols like ®) ------------------
     raw_name = _search(r"##\s*([^\n]+)", pages[0]["text"]) if pages else None
-    result["product_name"] = re.sub(r"[®™]", "", raw_name).strip() if raw_name else None
- 
-    # --- Thinning (İNCELTME) --------------------------------------------
-    thinning = _find_section(sections, "İNCELTME") or sections.get("İNCELTME")
-    pct = _search(r"%\s*(\d+)", thinning)
-    result["thinning_max_percent"] = int(pct) if pct else None
+    result["ürün_adı"] = re.sub(r"[®™]", "", raw_name).strip() if raw_name else None
  
     # --- Drying time (KURUMA SÜRESİ) ------------------------------------
     drying = _find_section(sections, "KURUMA", "SÜRE")
     if drying:
         touch_min, touch_max = _range(
             r"Dokunma kuruması:\s*(\d+)\s*[-–]\s*(\d+)\s*dakika", drying)
-        result["touch_dry_min_minutes"] = touch_min
-        result["touch_dry_max_minutes"] = touch_max
+        result["dokunma_kuruması_min"] = touch_min
+        result["dokunma_kuruması_max"] = touch_max
+        result["dokunma_kuruması_birimi"] = "dakika"
  
         recoat_min, recoat_max = _range(
             r"Katlar arası bekleme süresi:\s*(\d+)\s*[-–]\s*(\d+)\s*saat", drying)
-        result["recoat_time_min_hours"] = recoat_min
-        result["recoat_time_max_hours"] = recoat_max
+        result["katlar_arası_bekleme_min"] = recoat_min
+        result["katlar_arası_bekleme_max"] = recoat_max
+        result["katlar_arası_bekleme_birimi"] = "saat"
  
         cure = _search(r"Son Kuruma:\s*(\d+)\s*saat", drying)
-        result["full_cure_hours"] = int(cure) if cure else None
+        result["son_kuruma"] = int(cure) if cure else None
+        result["son_kuruma_birimi"] = "saat"
+
     else:
-        for k in ("touch_dry_min_minutes", "touch_dry_max_minutes",
-                   "recoat_time_min_hours", "recoat_time_max_hours",
-                   "full_cure_hours"):
+        for k in ("dokunma_kuruması_min", "dokunma_kuruması_max", "dokunma_kuruması_birimi",
+                   "katlar_arası_bekleme_min", "katlar_arası_bekleme_max", "katlar_arası_bekleme_birimi",
+                   "son_kuruma", "son_kuruma_birimi"):
             result[k] = None
  
     # --- Coverage / spread rate (SARFİYAT) ------------------------------
     coverage = _find_section(sections, "SARFİYAT") or sections.get("SARFİYAT")
     cov_min, cov_max = _range(
-        r"(\d+)\s*[-–]\s*(\d+)\s*m\s*2", coverage.replace("\n", " ") if coverage else "")
-    result["coverage_min_m2_per_l"] = cov_min
-    result["coverage_max_m2_per_l"] = cov_max
+        r"(\d+(?:[.,]\d+)?)\s*[-–]\s*(\d+(?:[.,]\d+)?)\s*m\s*2", coverage.replace("\n", " ") if coverage else "")
+    result["sarfiyat_min"] = cov_min
+    result["sarfiyat_max"] = cov_max
+    result["sarfiyat_birimi"] = "m²/litre"
  
     # --- Airless spray settings (Havasız (Airless) Püskürtmede) --------
     airless = (_find_section(sections, "havasız")
                or _find_section(sections, "airless")
                or _find_section(sections, "püskürtme"))
     press_min, press_max = _range(r"Basınç:\s*(\d+)\s*[-–]\s*(\d+)\s*bar", airless)
-    result["spray_pressure_min_bar"] = press_min
-    result["spray_pressure_max_bar"] = press_max
- 
-    angle = _search(r"Meme açısı:\s*(\d+)\s*°", airless)
-    result["spray_nozzle_angle_deg"] = int(angle) if angle else None
- 
-    nozzle = _search(r"Meme ölçüsü \(inch\):\s*([\d.,]+)", airless)
-    result["spray_nozzle_size_inch"] = _num(nozzle) if nozzle else None
+    result["havasız_püskürtme_basıncı_min"] = press_min
+    result["havasız_püskürtme_basıncı_max"] = press_max
+    result["havasız_püskürtme_basıncı_birimi"] = "bar"
  
     # --- Storage (DEPOLAMA) ---------------------------------------------
     storage = _find_section(sections, "DEPOLAMA") or sections.get("DEPOLAMA")
     shelf_life = _search(r"(\d+)\s*yıl", storage)
-    result["shelf_life_years"] = int(shelf_life) if shelf_life else None
+    result["depolama_süresi"] = int(shelf_life) if shelf_life else None
+    result["depolama_süresi_birimi"] = "Yıl"
  
     # --- Packaging (AMBALAJ) --------------------------------------------
     packaging = _find_section(sections, "AMBALAJ") or sections.get("AMBALAJ")
     sizes = re.findall(r"(\d+(?:[.,]\d+)?)\s*Litre", packaging) if packaging else []
-    result["packaging_sizes_liters"] = [_num(s) for s in sizes]
+    result["ambalaj_boyutları"] = [_num(s) for s in sizes]
+    result["ambalaj_boyutları_birimi"] = "Litre"
  
     # --- Application temperature range (UYARI-1) ------------------------
     uyari1 = sections.get("UYARI-1")
     temp_min, temp_max = _range(r"([+-]?\d+)\s*°C\s*ile\s*([+-]?\d+)\s*°C", uyari1)
-    result["application_temp_min_c"] = temp_min
-    result["application_temp_max_c"] = temp_max
+    result["uygulama_sıcaklığı_min"] = temp_min
+    result["uygulama_sıcaklığı_max"] = temp_max
+    result["uygulama_sıcaklığı_birimi"] = "°C"
  
     return result
 
