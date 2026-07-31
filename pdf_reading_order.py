@@ -502,6 +502,31 @@ def _merge_multiline_headings(line_items, same_line_tol=3.0, same_line_gap_facto
 _BULLET_PREFIXES = ("•", "-", "*", "‣", "◦")
 
 
+def _is_wrap_hyphen(prev_text, next_text):
+    """True if `prev_text` ends in a hyphen that's a PDF line-wrap artifact
+    splitting one word across two lines (e.g. 'getiril-' / 'melidir' ->
+    'getirilmelidir'), as opposed to a real dash or a hyphenated compound.
+
+    Heuristics: the character before the hyphen must be a letter (rules out
+    list-style '-' bullets and numeric ranges like '2020-'), and the next
+    line must start with a lowercase letter (real compounds/dashes at a
+    line end are rare enough, and a following capital usually means a new
+    sentence/proper noun rather than a word continuation)."""
+    if len(prev_text) < 2 or prev_text[-1] != "-":
+        return False
+    if not prev_text[-2].isalpha():
+        return False
+    if not next_text or not next_text[0].isalpha():
+        return False
+    return next_text[0].islower()
+
+
+def _join_wrap_hyphen(prev_text, next_text):
+    """Merges a hyphen-broken word back together: drops the trailing
+    hyphen from `prev_text` and glues `next_text` on with no space."""
+    return prev_text[:-1] + next_text
+
+
 def _assemble_text(line_items):
     """Turns the ordered list of line-dicts/break-markers into final text.
 
@@ -554,6 +579,8 @@ def _assemble_text(line_items):
             out.append(text)
         elif out[-1].endswith(('.', ':', ';', '!', '?')):
             out.append(text)
+        elif _is_wrap_hyphen(out[-1], text):
+            out[-1] = _join_wrap_hyphen(out[-1], text)
         else:
             out[-1] = out[-1] + " " + text
 

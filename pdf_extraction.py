@@ -1,28 +1,14 @@
-"""
-Extracts structured paint properties (thinning, drying time, coverage,
-airless spray settings, storage, packaging, standards, etc.) from a
-Filli Boya-style Technical Data Sheet PDF.
-
-This is intentionally tailored to this document family: it relies on the
-'## HEADING' markers that pdf_reading_order2.extract_pdf_text() produces,
-and on the fixed set of Turkish section headings that appear in Filli
-Boya TDS PDFs (İNCELTME, KURUMA SÜRESİ, SARFİYAT, Havasız (Airless)
-Püskürtmede, DEPOLAMA, AMBALAJ, UYARI-1/2, TS .../G tebliğine uygundur).
-It will NOT generalize to arbitrary/unrelated PDFs.
-
-Usage:
-    python3 extract_properties.py TDS_AQUALUX.pdf
-"""
-
 import re
 import sys
 import json
 
-from pdf_reading_order import extract_pdf_text
 
 #TDS_AQUALUX.pdf
 #TDS_EXXENMAT.pdf
-PDF_PATH = "dataset/TDS_EXXENMAT.pdf"
+#TDS_WOODMAXX_WOODSTAIN.pdf
+#TDS_MOMENTOPLASTIX.pdf
+#TDS_AQUSTO_SILAN.pdf
+PDF_PATH = "dataset/TDS_AQUSTO_SILAN.pdf"
 
 
 
@@ -138,8 +124,7 @@ def _value_unit(pattern, text):
 # Step 3: extraction
 # ---------------------------------------------------------------------------
  
-def extract_paint_properties(pdf_path):
-    pages = extract_pdf_text(pdf_path)
+def extract_paint_properties(pages):
     sections = {}
     for p in pages:
         sections.update(_sections_from_text(p["text"]))
@@ -159,6 +144,9 @@ def extract_paint_properties(pdf_path):
 
 
     result["voc_uyumlu"] = bool(re.search(r"VOC\s*Uyumlu", intro_paragraph, re.IGNORECASE))
+
+    kullanım_match = re.search(r"(iç\s*cephe|dış\s*cephe)", intro_paragraph, re.IGNORECASE)
+    result["kullanım_alanı"] = re.sub(r"\s+", " ", kullanım_match.group(1)).strip().lower() if kullanım_match else None
 
     # --- Doku: parlak mı mat mı? ------------------------------------------
     # Ordered most-specific-first so "lüks parlak" / "yarı mat" etc. win
@@ -202,7 +190,7 @@ def extract_paint_properties(pdf_path):
     result["sarfiyat_min"] = cov_min
     result["sarfiyat_max"] = cov_max
     # normalize whitespace/superscript variants of the captured unit (e.g. "m 2", "m2") to "m²"
-    result["sarfiyat_birimi"] = re.sub(r"m\s?2", "m²", cov_unit) if cov_unit else None
+    result["sarfiyat_birimi"] = re.sub(r"m\s?2", "m²", cov_unit) + "/Litre" if cov_unit else None
  
     # --- Airless spray settings (Havasız (Airless) Püskürtmede) --------
     airless = (_find_section(sections, "havasız")
@@ -226,14 +214,7 @@ def extract_paint_properties(pdf_path):
     result["ambalaj_boyutları"] = [_num(s[0]) for s in sizes]
     result["ambalaj_boyutları_birimi"] = sizes[0][1] if sizes else None
  
-    # --- Application temperature range (UYARI-1) ------------------------
-    uyari1 = sections.get("UYARI-1")
-    temp_min, temp_max, temp_unit = _range_unit(
-        r"([+-]?\d+)\s*°C\s*ile\s*([+-]?\d+)\s*(°C)", uyari1)
-    result["uygulama_sıcaklığı_min"] = temp_min
-    result["uygulama_sıcaklığı_max"] = temp_max
-    result["uygulama_sıcaklığı_birimi"] = temp_unit
- 
+
     return result
 
 if __name__ == "__main__":
