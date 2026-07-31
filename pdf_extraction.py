@@ -18,7 +18,7 @@ import re
 import sys
 import json
 
-from pdf_reading_order2 import extract_pdf_text
+from pdf_reading_order import extract_pdf_text
 
 #TDS_AQUALUX.pdf
 #TDS_EXXENMAT.pdf
