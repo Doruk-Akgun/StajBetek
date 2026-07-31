@@ -22,7 +22,7 @@ from pdf_reading_order import extract_pdf_text
 
 #TDS_AQUALUX.pdf
 #TDS_EXXENMAT.pdf
-PDF_PATH = "dataset/TDS_AQUALUX.pdf"
+PDF_PATH = "dataset/TDS_EXXENMAT.pdf"
 
 
 
@@ -108,7 +108,7 @@ def _range(pattern, text):
     if not m:
         return None, None
     return _num(m.group(1)), _num(m.group(2))
- 
+
 
 def _range_unit(pattern, text):
     """Runs `pattern` (must have exactly 3 capture groups: min, max, unit)
@@ -120,8 +120,8 @@ def _range_unit(pattern, text):
     if not m:
         return None, None, None
     return _num(m.group(1)), _num(m.group(2)), m.group(3).strip()
- 
- 
+
+
 def _value_unit(pattern, text):
     """Runs `pattern` (must have exactly 2 capture groups: value, unit)
     and returns (value, unit) -- the unit is read directly from the
@@ -132,8 +132,8 @@ def _value_unit(pattern, text):
     if not m:
         return None, None
     return _num(m.group(1)), m.group(2).strip()
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Step 3: extraction
 # ---------------------------------------------------------------------------
@@ -149,6 +149,24 @@ def extract_paint_properties(pdf_path):
     # --- Product name (strip trademark symbols like ®) ------------------
     raw_name = _search(r"##\s*([^\n]+)", pages[0]["text"]) if pages else None
     result["ürün_adı"] = re.sub(r"[®™]", "", raw_name).strip() if raw_name else None
+
+    intro_match = re.search(r"^##[^\n]*\n(.*?)(?=\n##\s|\Z)",
+                             pages[0]["text"] if pages else "", re.DOTALL)
+    intro_paragraph = intro_match.group(1).strip() if intro_match else ""
+
+    # --- Su bazlı mı? (water-based) --------------------------------------
+    result["su_bazlı"] = bool(re.search(r"su\s*bazlı", intro_paragraph, re.IGNORECASE))
+
+
+    result["voc_uyumlu"] = bool(re.search(r"VOC\s*Uyumlu", intro_paragraph, re.IGNORECASE))
+
+    # --- Doku: parlak mı mat mı? ------------------------------------------
+    # Ordered most-specific-first so "lüks parlak" / "yarı mat" etc. win
+    # over the bare "parlak"/"mat" alternative.
+    doku_match = re.search(
+        r"(lüks\s*parlak|yarı\s*parlak|tam\s*parlak|parlak|yarı\s*mat|tam\s*mat|mat)",
+        intro_paragraph, re.IGNORECASE)
+    result["doku"] = doku_match.group(1).strip() if doku_match else None
  
     # --- Drying time (KURUMA SÜRESİ) ------------------------------------
     drying = _find_section(sections, "KURUMA", "SÜRE")
@@ -169,7 +187,7 @@ def extract_paint_properties(pdf_path):
             r"Son Kuruma:\s*(\d+)\s*(dakika|saat|gün)", drying)
         result["son_kuruma"] = cure_val
         result["son_kuruma_birimi"] = cure_unit
- 
+
     else:
         for k in ("dokunma_kuruması_min", "dokunma_kuruması_max", "dokunma_kuruması_birimi",
                    "katlar_arası_bekleme_min", "katlar_arası_bekleme_max", "katlar_arası_bekleme_birimi",
@@ -217,7 +235,7 @@ def extract_paint_properties(pdf_path):
     result["uygulama_sıcaklığı_birimi"] = temp_unit
  
     return result
- 
+
 if __name__ == "__main__":
     path = PDF_PATH
     result = extract_paint_properties(path)
