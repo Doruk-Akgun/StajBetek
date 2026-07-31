@@ -109,7 +109,31 @@ def _range(pattern, text):
         return None, None
     return _num(m.group(1)), _num(m.group(2))
  
+
+def _range_unit(pattern, text):
+    """Runs `pattern` (must have exactly 3 capture groups: min, max, unit)
+    and returns (min, max, unit) -- the unit is read directly from the
+    document text, not assumed. Returns (None, None, None) if no match."""
+    if not text:
+        return None, None, None
+    m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None, None, None
+    return _num(m.group(1)), _num(m.group(2)), m.group(3).strip()
  
+ 
+def _value_unit(pattern, text):
+    """Runs `pattern` (must have exactly 2 capture groups: value, unit)
+    and returns (value, unit) -- the unit is read directly from the
+    document text. Returns (None, None) if no match."""
+    if not text:
+        return None, None
+    m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None, None
+    return _num(m.group(1)), m.group(2).strip()
+
+
 # ---------------------------------------------------------------------------
 # Step 3: extraction
 # ---------------------------------------------------------------------------
@@ -129,22 +153,23 @@ def extract_paint_properties(pdf_path):
     # --- Drying time (KURUMA SÜRESİ) ------------------------------------
     drying = _find_section(sections, "KURUMA", "SÜRE")
     if drying:
-        touch_min, touch_max = _range(
-            r"Dokunma kuruması:\s*(\d+)\s*[-–]\s*(\d+)\s*dakika", drying)
+        touch_min, touch_max, touch_unit = _range_unit(
+            r"Dokunma kuruması:\s*(\d+)\s*[-–]\s*(\d+)\s*(dakika|saat|gün)", drying)
         result["dokunma_kuruması_min"] = touch_min
         result["dokunma_kuruması_max"] = touch_max
-        result["dokunma_kuruması_birimi"] = "dakika"
+        result["dokunma_kuruması_birimi"] = touch_unit
  
-        recoat_min, recoat_max = _range(
-            r"Katlar arası bekleme süresi:\s*(\d+)\s*[-–]\s*(\d+)\s*saat", drying)
+        recoat_min, recoat_max, recoat_unit = _range_unit(
+            r"Katlar arası bekleme süresi:\s*(\d+)\s*[-–]\s*(\d+)\s*(dakika|saat|gün)", drying)
         result["katlar_arası_bekleme_min"] = recoat_min
         result["katlar_arası_bekleme_max"] = recoat_max
-        result["katlar_arası_bekleme_birimi"] = "saat"
+        result["katlar_arası_bekleme_birimi"] = recoat_unit
  
-        cure = _search(r"Son Kuruma:\s*(\d+)\s*saat", drying)
-        result["son_kuruma"] = int(cure) if cure else None
-        result["son_kuruma_birimi"] = "saat"
-
+        cure_val, cure_unit = _value_unit(
+            r"Son Kuruma:\s*(\d+)\s*(dakika|saat|gün)", drying)
+        result["son_kuruma"] = cure_val
+        result["son_kuruma_birimi"] = cure_unit
+ 
     else:
         for k in ("dokunma_kuruması_min", "dokunma_kuruması_max", "dokunma_kuruması_birimi",
                    "katlar_arası_bekleme_min", "katlar_arası_bekleme_max", "katlar_arası_bekleme_birimi",
@@ -153,42 +178,46 @@ def extract_paint_properties(pdf_path):
  
     # --- Coverage / spread rate (SARFİYAT) ------------------------------
     coverage = _find_section(sections, "SARFİYAT") or sections.get("SARFİYAT")
-    cov_min, cov_max = _range(
-        r"(\d+(?:[.,]\d+)?)\s*[-–]\s*(\d+(?:[.,]\d+)?)\s*m\s*2", coverage.replace("\n", " ") if coverage else "")
+    cov_min, cov_max, cov_unit = _range_unit(
+        r"(\d+(?:[.,]\d+)?)\s*[-–]\s*(\d+(?:[.,]\d+)?)\s*(m\s?2|m²)",
+        coverage.replace("\n", " ") if coverage else "")
     result["sarfiyat_min"] = cov_min
     result["sarfiyat_max"] = cov_max
-    result["sarfiyat_birimi"] = "m²/litre"
+    # normalize whitespace/superscript variants of the captured unit (e.g. "m 2", "m2") to "m²"
+    result["sarfiyat_birimi"] = re.sub(r"m\s?2", "m²", cov_unit) if cov_unit else None
  
     # --- Airless spray settings (Havasız (Airless) Püskürtmede) --------
     airless = (_find_section(sections, "havasız")
                or _find_section(sections, "airless")
                or _find_section(sections, "püskürtme"))
-    press_min, press_max = _range(r"Basınç:\s*(\d+)\s*[-–]\s*(\d+)\s*bar", airless)
+    press_min, press_max, press_unit = _range_unit(
+        r"Basınç:\s*(\d+)\s*[-–]\s*(\d+)\s*(bar|psi)", airless)
     result["havasız_püskürtme_basıncı_min"] = press_min
     result["havasız_püskürtme_basıncı_max"] = press_max
-    result["havasız_püskürtme_basıncı_birimi"] = "bar"
+    result["havasız_püskürtme_basıncı_birimi"] = press_unit
  
     # --- Storage (DEPOLAMA) ---------------------------------------------
     storage = _find_section(sections, "DEPOLAMA") or sections.get("DEPOLAMA")
-    shelf_life = _search(r"(\d+)\s*yıl", storage)
-    result["depolama_süresi"] = int(shelf_life) if shelf_life else None
-    result["depolama_süresi_birimi"] = "Yıl"
+    shelf_val, shelf_unit = _value_unit(r"(\d+)\s*(yıl|ay|gün)", storage)
+    result["depolama_süresi"] = shelf_val
+    result["depolama_süresi_birimi"] = shelf_unit
  
     # --- Packaging (AMBALAJ) --------------------------------------------
     packaging = _find_section(sections, "AMBALAJ") or sections.get("AMBALAJ")
-    sizes = re.findall(r"(\d+(?:[.,]\d+)?)\s*Litre", packaging) if packaging else []
-    result["ambalaj_boyutları"] = [_num(s) for s in sizes]
-    result["ambalaj_boyutları_birimi"] = "Litre"
+    sizes = re.findall(r"(\d+(?:[.,]\d+)?)\s*(Litre|litre|L)\b", packaging) if packaging else []
+    result["ambalaj_boyutları"] = [_num(s[0]) for s in sizes]
+    result["ambalaj_boyutları_birimi"] = sizes[0][1] if sizes else None
  
     # --- Application temperature range (UYARI-1) ------------------------
     uyari1 = sections.get("UYARI-1")
-    temp_min, temp_max = _range(r"([+-]?\d+)\s*°C\s*ile\s*([+-]?\d+)\s*°C", uyari1)
+    temp_min, temp_max, temp_unit = _range_unit(
+        r"([+-]?\d+)\s*°C\s*ile\s*([+-]?\d+)\s*(°C)", uyari1)
     result["uygulama_sıcaklığı_min"] = temp_min
     result["uygulama_sıcaklığı_max"] = temp_max
-    result["uygulama_sıcaklığı_birimi"] = "°C"
+    result["uygulama_sıcaklığı_birimi"] = temp_unit
  
     return result
-
+ 
 if __name__ == "__main__":
     path = PDF_PATH
     result = extract_paint_properties(path)
