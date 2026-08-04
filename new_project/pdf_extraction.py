@@ -1,6 +1,7 @@
 import re
 import sys
 import json
+from pdf_reading_order import extract_pdf_text
 
 
 #TDS_AQUALUX.pdf
@@ -8,7 +9,7 @@ import json
 #TDS_WOODMAXX_WOODSTAIN.pdf
 #TDS_MOMENTOPLASTIX.pdf
 #TDS_AQUSTO_SILAN.pdf
-PDF_PATH = "dataset/TDS_AQUSTO_SILAN.pdf"
+PDF_PATH = "dataset/TDS_MOMENTOSILAN.pdf"
 
 
 
@@ -219,5 +220,6 @@ def extract_paint_properties(pages):
 
 if __name__ == "__main__":
     path = PDF_PATH
-    result = extract_paint_properties(path)
+    pages = extract_pdf_text(path)
+    result = extract_paint_properties(pages)
     print(json.dumps(result, ensure_ascii=False, indent=2))

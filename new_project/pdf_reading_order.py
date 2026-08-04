@@ -262,8 +262,8 @@ def _xy_cut_to_lines(items, min_gap_x=5, min_gap_y=3, depth=0, max_depth=10, lin
             left = [it for it in items if (it["x0"] + it["x1"]) / 2 < split_x]
             right = [it for it in items if (it["x0"] + it["x1"]) / 2 >= split_x]
             if left and right:
-                left_lines = _xy_cut_to_lines(left, min_gap_x, min_gap_y, depth + 1, max_depth, line_tol)
-                right_lines = _xy_cut_to_lines(right, min_gap_x, min_gap_y, depth + 1, max_depth, line_tol)
+                left_lines = _xy_cut_to_lines(left, min_gap_x, min_gap_y, depth + 1, max_depth, line_tol, x_gap_size_ratio)
+                right_lines = _xy_cut_to_lines(right, min_gap_x, min_gap_y, depth + 1, max_depth, line_tol, x_gap_size_ratio)
                 return left_lines + [{"break": "col"}] + right_lines
 
     if depth < max_depth:
@@ -275,8 +275,8 @@ def _xy_cut_to_lines(items, min_gap_x=5, min_gap_y=3, depth=0, max_depth=10, lin
             top = [it for it in items if (it["y0"] + it["y1"]) / 2 < split_y]
             bottom = [it for it in items if (it["y0"] + it["y1"]) / 2 >= split_y]
             if top and bottom:
-                top_lines = _xy_cut_to_lines(top, min_gap_x, min_gap_y, depth + 1, max_depth, line_tol)
-                bottom_lines = _xy_cut_to_lines(bottom, min_gap_x, min_gap_y, depth + 1, max_depth, line_tol)
+                top_lines = _xy_cut_to_lines(top, min_gap_x, min_gap_y, depth + 1, max_depth, line_tol, x_gap_size_ratio)
+                bottom_lines = _xy_cut_to_lines(bottom, min_gap_x, min_gap_y, depth + 1, max_depth, line_tol, x_gap_size_ratio)
                 return top_lines + [{"break": "row"}] + bottom_lines
 
     # Base case: this group of words is one coherent column/paragraph
