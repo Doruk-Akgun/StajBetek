@@ -692,7 +692,7 @@ def extract_pdf_text(pdf_path, min_gap_x=5, min_gap_y=3, line_tol=2.5,
 
 if __name__ == "__main__":
     import sys
-    path = sys.argv[1] if len(sys.argv) > 1 else "TDS_AQUALUX.pdf"
+    path = sys.argv[1] if len(sys.argv) > 1 else "dataset\\TDS_MOMENTOSILAN.pdf"
     for page in extract_pdf_text(path):
         print(f"\n===== Page {page['page_number']} =====")
         print(page["text"])
