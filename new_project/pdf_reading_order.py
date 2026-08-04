@@ -425,8 +425,31 @@ def _score_and_flag_headings(line_items, body_size, size_ratio=1.1,
             prev_line is not None
             and prev_line["text"].rstrip().endswith(('.', ':', ';', '!', '?'))
         )
+        continues_hyphenated_word = (
+            prev_line is not None
+            and _is_wrap_hyphen(prev_line["text"].rstrip(), text)
+        )
         starts_new_paragraph = after_whitespace or prev_ended_sentence or prev_line is None
-        mid_sentence = not starts_new_paragraph
+        # A line that continues a hyphen-broken WORD from the previous
+        # line (e.g. 'demir-çelik-sac yü-' / 'zeylerde uygulama:') isn't
+        # "mid-sentence" in the sense the -3 penalty is meant to catch.
+        # Same idea for a line directly beneath an already-confirmed
+        # heading that shares its bold/margin styling and isn't itself
+        # sentence-terminated (e.g. 'Cam, Seramik ve Duvar Kağıdı' /
+        # 'Yüzeylerde Uygulama:') -- an ordinary space-wrapped multi-line
+        # title, not a paragraph continuing mid-sentence. Neither case is
+        # a fresh paragraph either, so both are scored as neutral rather
+        # than penalized -- verified this doesn't let real body-text
+        # wrap-continuations slip through: those still lack the bold
+        # points that drive a real heading over threshold.
+        continues_heading_wrap = (
+            prev_line is not None
+            and prev_line.get("is_heading")
+            and bold and starts_margin
+            and not prev_ended_sentence
+        )
+        mid_sentence = not starts_new_paragraph and not (
+            continues_hyphenated_word or continues_heading_wrap)
         score = 0
         score += 3 if bold else -2
         score += 2 if larger else 0
@@ -443,6 +466,69 @@ def _score_and_flag_headings(line_items, body_size, size_ratio=1.1,
 
         prev_line = item
         prev_was_break = False
+
+
+def _merge_wrapped_headings(line_items):
+    """Joins a heading label that got wrapped across two physical lines
+    back into one heading -- either a mid-word hyphen break (e.g. 'Kireç
+    ve Gevşek Tabaka Temiz-' / 'liği: Boya altındaki...', 'demir-çelik-
+    sac yü-' / 'zeylerde uygulama:') or an ordinary space wrap of a title
+    too long for one line (e.g. 'Cam, Seramik ve Duvar Kağıdı' /
+    'Yüzeylerde Uygulama:').
+
+    This is different from _merge_multiline_headings: that pass handles
+    one title accidentally split into two side-by-side column pieces on
+    the SAME baseline. This handles a title that's genuinely two stacked
+    lines because the label was too long for one line. A hyphen-wrapped
+    tail commonly satisfies _leading_bold_prefix on its own (a short
+    bold token ending in ':', e.g. 'liği:'), so it arrives here as its
+    own separate heading with an inline_heading_rest -- carried over
+    onto the merged heading so it still flows as that heading's opening
+    body line."""
+    result = []
+    i, n = 0, len(line_items)
+    while i < n:
+        item = line_items[i]
+        if (item.get("break") or not item.get("is_heading")
+                or item.get("inline_heading_prefix")):
+            result.append(item)
+            i += 1
+            continue
+
+        nxt = line_items[i + 1] if i + 1 < n else None
+        if nxt is not None and not nxt.get("break") and nxt.get("is_heading"):
+            nxt_label = nxt.get("inline_heading_prefix", nxt["text"]).strip()
+            item_text = item["text"].strip()
+            if _is_wrap_hyphen(item_text, nxt_label):
+                merged_text = _join_wrap_hyphen(item_text, nxt_label)
+            elif not item_text.endswith((".", ":", ";", "!", "?")):
+                # Not a hyphen break, but the first line also isn't
+                # sentence-terminated -- an ordinary space-wrapped title
+                # split across two lines (e.g. 'Cam, Seramik ve Duvar
+                # Kağıdı' / 'Yüzeylerde Uygulama:'), not two distinct
+                # headings. Join with a space instead of a hyphen-splice.
+                merged_text = item_text + " " + nxt_label
+            else:
+                merged_text = None
+            if merged_text is not None:
+                merged = dict(item)
+                merged["text"] = merged_text
+                merged["bbox"] = (
+                    min(item["bbox"][0], nxt["bbox"][0]),
+                    min(item["bbox"][1], nxt["bbox"][1]),
+                    max(item["bbox"][2], nxt["bbox"][2]),
+                    max(item["bbox"][3], nxt["bbox"][3]),
+                )
+                if nxt.get("inline_heading_rest"):
+                    merged["inline_heading_prefix"] = merged_text
+                    merged["inline_heading_rest"] = nxt["inline_heading_rest"]
+                result.append(merged)
+                i += 2
+                continue
+
+        result.append(item)
+        i += 1
+    return result
 
 
 def _merge_multiline_headings(line_items, same_line_tol=3.0, same_line_gap_factor=1.0):
@@ -679,6 +765,7 @@ def extract_pdf_text(pdf_path, min_gap_x=5, min_gap_y=3, line_tol=2.5,
         _score_and_flag_headings(lines, body_size, size_ratio=heading_size_ratio,
                                   threshold=heading_threshold)
         lines = _merge_multiline_headings(lines)
+        lines = _merge_wrapped_headings(lines)
         pages_lines.append(lines)
         page_numbers.append(i + 1)
 
@@ -697,7 +784,7 @@ def extract_pdf_text(pdf_path, min_gap_x=5, min_gap_y=3, line_tol=2.5,
 
 if __name__ == "__main__":
     import sys
-    path = sys.argv[1] if len(sys.argv) > 1 else "dataset\\TDS_MOMENTOSILAN.pdf"
+    path = sys.argv[1] if len(sys.argv) > 1 else "dataset\\TDS_MOMENTOPLASTIX.pdf"
     for page in extract_pdf_text(path):
         print(f"\n===== Page {page['page_number']} =====")
         print(page["text"])
