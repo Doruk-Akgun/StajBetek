@@ -253,7 +253,12 @@ def _xy_cut_to_lines(items, min_gap_x=5, min_gap_y=3, depth=0, max_depth=10, lin
 
     if depth < max_depth:
         max_height = max((it["y1"] - it["y0"] for it in items), default=0)
-        effective_min_gap_x = max(min_gap_x, x_gap_size_ratio * max_height)
+        num_lines = len(_group_into_lines(items, tol=line_tol))
+        y_span = hi_y - lo_y
+        if num_lines <= 2 or y_span > 200:
+            effective_min_gap_x = max(min_gap_x, x_gap_size_ratio * max_height)
+        else:
+            effective_min_gap_x = max(min_gap_x / 2, 2.0)
         x_gaps = _project_gaps(xs, lo_x, hi_x, effective_min_gap_x)
         x_gaps = [g for g in x_gaps if g[0] > lo_x + 1 and g[1] < hi_x - 1]
         if x_gaps:
