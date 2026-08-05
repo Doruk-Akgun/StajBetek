@@ -26,7 +26,7 @@ PDF_PATHS = [os.path.join(DATASET_PATH, file) for file in PDF_FILES]
 
 
 CHROMA_DB_PATH = "./paint_db"
-COLLECTION_NAME = "test1"
+COLLECTION_NAME = "test6"
 
 # Structured properties extracted per document during ingestion, keyed by
 # doc_id (filled in by ingest_pdf via extract_paint_properties(pages)).
@@ -41,6 +41,11 @@ VECTOR_TOP_K = 15
 BM25_TOP_K = 15
 FINAL_TOP_K = 5
 RRF_K = 60  # standard RRF damping constant
+
+# Widened candidate pool for "semantic_qa" intent: retrieve more, then
+# collapse to one chunk per parent so a single document can't occupy
+# every slot before we even get to pick the best FINAL_TOP_K.
+SEMANTIC_QA_CANDIDATE_K = 40
 
 
 SEARCH_MODE = "hybrid_parent_child"
@@ -256,14 +261,120 @@ def reciprocal_rank_fusion(ranked_id_lists, k=RRF_K):
 
 
 # ---------------------------------------------------------
+# 4e-2. Query rewriting: ask the LLM to turn the raw user input into
+#     (a) a clean, keyword-rich string to embed/BM25-search with, and
+#     (b) any metadata filters it can confidently infer from the wording
+#     (e.g. "su bazlı ürünler" -> prop_su_bazlı: true). The ORIGINAL
+#     question is still what gets shown to the answering LLM later --
+#     only retrieval uses the rewritten form.
+# ---------------------------------------------------------
+_FILTERABLE_FIELDS = """- source: exact PDF filename, one of {files}
+- prop_su_bazlı: true / false
+- prop_voc_uyumlu: true / false
+- prop_kullanım_alanı: "iç cephe" or "dış cephe"
+- prop_doku: e.g. "mat", "parlak", "yarı mat", "yarı parlak"
+- prop_sarfiyat_min / prop_sarfiyat_max: numbers (m²/Litre)
+- prop_depolama_süresi: number (depolama_süresi_birimi'ndeki birimde)
+- prop_ambalaj_boyutları: comma-separated package sizes, e.g. "2.5, 7.5, 15\"""".format(files=PDF_FILES)
+
+
+def rewrite_query(user_question):
+    """Returns (search_query, where, display_property). `where` is a
+    Chroma-compatible filter dict, or None if the LLM found nothing
+    clearly filterable -- in that case retrieval behaves exactly as
+    before (unfiltered). `display_property` is a short, human-readable
+    label (in the question's own language) for the main filtered
+    attribute, e.g. "Su bazlı" or "VOC uyumlu" -- it's only consumed by
+    the metadata_list formatter and is "" when nothing was filterable."""
+    system_prompt = f"""You rewrite user questions for a product-datasheet search engine and extract metadata filters.
+
+Available metadata fields you may filter on (use these exact key names):
+{_FILTERABLE_FIELDS}
+
+Respond with ONLY minified JSON, no prose, no markdown fences, in exactly this shape:
+{{"search_query": "<cleaned up, keyword-rich version of the question, same language as the question>", "filters": {{"field_name": value}}, "display_property": "<short human-readable label, same language as the question, naming the main filtered property, e.g. 'Su bazlı' or 'VOC uyumlu'; empty string if nothing is filterable>"}}
+
+Rules:
+- Only include a field in "filters" if the question CLEARLY states it (don't guess).
+- For a numeric range like "10 m2'den az sarfiyatlı" use the operator form: {{"prop_sarfiyat_max": {{"$lte": 10}}}}.
+- If nothing is filterable, use "filters": {{}} and "display_property": "".
+"""
+    user_prompt = f"User question: {user_question}"
+
+    try:
+        raw = ask_llm(system_prompt=system_prompt, user_prompt=user_prompt)
+        cleaned = raw.strip().strip("`")
+        if cleaned[:4].lower() == "json":
+            cleaned = cleaned[4:].strip()
+        parsed = json.loads(cleaned)
+        search_query = parsed.get("search_query") or user_question
+        filters = parsed.get("filters") or {}
+        display_property = parsed.get("display_property") or ""
+    except Exception as e:
+        print(f"   [rewrite_query] falling back to raw question ({e})")
+        search_query, filters, display_property = user_question, {}, ""
+
+    return search_query, _filters_to_where(filters), display_property
+
+
+def _filters_to_where(filters):
+    """{'prop_doku': 'mat', 'prop_sarfiyat_max': {'$lte': 10}} -> Chroma
+    `where` clause. Bare values become equality; dict values (e.g.
+    {'$lte': 10}) pass through as-is. None if there's nothing to filter."""
+    if not filters:
+        return None
+    clauses = []
+    for key, value in filters.items():
+        if value is None:
+            continue
+        if value == "":
+            continue
+        clauses.append({key: value} if isinstance(value, dict) else {key: {"$eq": value}})
+    if not clauses:
+        return None
+    return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+
+
+def _record_matches_where(metadata, where):
+    """Minimal local evaluator for the same `where` shape, used to filter
+    the in-memory BM25 candidate pool (Chroma's `where` only applies
+    server-side to `collection.query`/`.get`, not to our own bm25 index)."""
+    if where is None:
+        return True
+    if "$and" in where:
+        return all(_record_matches_where(metadata, clause) for clause in where["$and"])
+    (key, cond), = where.items()
+    if key not in metadata:
+        return False
+    actual = metadata[key]
+    if isinstance(cond, dict):
+        op, expected = next(iter(cond.items()))
+        if op == "$eq":
+            return actual == expected
+        if op == "$ne":
+            return actual != expected
+        if op == "$gt":
+            return actual > expected
+        if op == "$gte":
+            return actual >= expected
+        if op == "$lt":
+            return actual < expected
+        if op == "$lte":
+            return actual <= expected
+        return False
+    return actual == cond
+
+
+# ---------------------------------------------------------
 # 4f. Retrieval mode: semantic-only (dense vector) search.
 #     Returns a ranked list of {"id", "text", "metadata"} records.
 # ---------------------------------------------------------
-def semantic_search(user_question, collection, final_n=FINAL_TOP_K):
+def semantic_search(user_question, collection, final_n=FINAL_TOP_K, where=None):
     query_vector = get_embedding(user_question)
     results = collection.query(
         query_embeddings=[query_vector],
         n_results=final_n,
+        where=where,
         include=["documents", "metadatas", "distances"],
     )
     ids = results["ids"][0]
@@ -277,24 +388,28 @@ def semantic_search(user_question, collection, final_n=FINAL_TOP_K):
 # 4g. Retrieval mode: hybrid (vector + BM25, fused with RRF).
 #     Returns a ranked list of {"id", "text", "metadata"} records.
 # ---------------------------------------------------------
-def hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K):
-    # --- Vector (dense) search ---
+def hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K, where=None,
+                   vector_top_k=VECTOR_TOP_K, bm25_top_k=BM25_TOP_K):
+    # --- Vector (dense) search --- (Chroma applies `where` server-side)
     query_vector = get_embedding(user_question)
     vector_results = collection.query(
         query_embeddings=[query_vector],
-        n_results=VECTOR_TOP_K,
+        n_results=vector_top_k,
+        where=where,
         include=["metadatas", "distances"],
     )
     vector_ids = vector_results["ids"][0]
     vector_distances = vector_results["distances"][0]
     vector_ranked_ids = vector_ids  # no filtering, just ranking as before
 
-    # --- BM25 (sparse/keyword) search ---
+    # --- BM25 (sparse/keyword) search --- (apply `where` locally first)
     tokenized_query = tokenize(user_question)
     bm25_scores = bm25_index["bm25"].get_scores(tokenized_query)
-    ranked_indices = sorted(
-        range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
-    )[:BM25_TOP_K]
+    eligible_indices = [
+        i for i in range(len(bm25_scores))
+        if _record_matches_where(bm25_index["metadatas"][i], where)
+    ]
+    ranked_indices = sorted(eligible_indices, key=lambda i: bm25_scores[i], reverse=True)[:bm25_top_k]
     bm25_ranked_ids = [bm25_index["ids"][i] for i in ranked_indices]
 
     # --- Fuse the two rankings ---
@@ -318,6 +433,193 @@ def hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K):
     }
 
     return [id_to_record[doc_id] for doc_id in top_ids if doc_id in id_to_record]
+
+
+# ---------------------------------------------------------
+# 4g-2. Intent classification -- routes a question to one of three
+#     retrieval strategies BEFORE any search happens. This is what fixes
+#     "Hangi boyalar su bazlıdır?": that's a list-all-matches question,
+#     not a nearest-neighbor question, so it must never touch embeddings.
+# ---------------------------------------------------------
+def classify_intent(user_question):
+    """Returns (intent, products).
+    intent is one of "semantic_qa" / "metadata_list" / "metadata_question" / "comparison".
+    products is only populated (and only used) when intent == "comparison" --
+    exact filenames from PDF_FILES that the question refers to."""
+    system_prompt = f"""Classify the user's question into exactly one intent for a product-datasheet search system.
+
+Intents:
+- "semantic_qa": asks about a specific descriptive detail of ONE product that is NOT one of the structured filter fields below (e.g. drying time, coverage, storage instructions, application steps, "what is X").
+  Example: "What is AquaLux drying time?" -> semantic_qa
+- "metadata_list": asks to LIST or FILTER products ACROSS THE WHOLE CATALOG by a shared structured attribute (su bazlı, VOC uyumlu, kullanım alanı, doku, etc.).
+  Example: "Which paints are water based?" -> metadata_list
+- "metadata_question": asks a yes/no or short factual question about ONE named product's structured attribute (su bazlı, VOC uyumlu, kullanım alanı, doku, etc.).
+  Example: "AquaLux su bazlı mı?" -> metadata_question
+- "comparison": asks to compare two or more NAMED products against each other.
+  Example: "Compare AquaLux and Momento Plastix" -> comparison
+
+Known product files: {PDF_FILES}
+
+Respond with ONLY minified JSON, no prose, no markdown fences, in exactly this shape:
+{{"intent": "semantic_qa" | "metadata_list" | "metadata_question" | "comparison", "products": ["<exact filename from the known list>", ...]}}
+
+"products" must only contain exact filenames from the known list above, matched from whatever product names/brands the question mentions. Leave it as [] unless intent is "comparison".
+"""
+    user_prompt = f"User question: {user_question}"
+
+    try:
+        raw = ask_llm(system_prompt=system_prompt, user_prompt=user_prompt)
+        cleaned = raw.strip().strip("`")
+        if cleaned[:4].lower() == "json":
+            cleaned = cleaned[4:].strip()
+        parsed = json.loads(cleaned)
+        intent = parsed.get("intent")
+        products = [p for p in (parsed.get("products") or []) if p in PDF_FILES]
+        if intent not in ("semantic_qa", "metadata_list", "metadata_question", "comparison"):
+            raise ValueError(f"unexpected intent {intent!r}")
+    except Exception as e:
+        print(f"   [classify_intent] falling back to semantic_qa ({e})")
+        intent, products = "semantic_qa", []
+
+    return intent, products
+
+
+# ---------------------------------------------------------
+# 4g-3. Strategy for "semantic_qa": keep hybrid retrieval, but widen the
+#     candidate pool and then collapse to ONE (highest-ranked) chunk per
+#     parent, so one document's many chunks can't crowd out others.
+# ---------------------------------------------------------
+def dedupe_by_parent(records, keep_n=None):
+    """`records` is already ranked (RRF/vector order) -- keep the first
+    (best) record seen for each parent_id, or `source` as a fallback key
+    for chunks that don't carry a parent_id (e.g. parent-child disabled)."""
+    seen = set()
+    deduped = []
+    for r in records:
+        key = r["metadata"].get("parent_id") or r["metadata"].get("source")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+    return deduped[:keep_n] if keep_n else deduped
+
+
+# ---------------------------------------------------------
+# 4g-4. Strategy for "metadata_question": NEVER runs vector similarity
+#     search. Filters are turned into a Chroma `where` clause and passed
+#     to collection.get(...), which returns every matching child chunk
+#     with no ranking/truncation involved. Then we deduplicate down to
+#     one representative record per SOURCE DOCUMENT (expanded to that
+#     chunk's parent for a fuller excerpt) so every matching product gets
+#     exactly one slot in the final context, regardless of how many
+#     chunks of it matched. This one representative excerpt is what still
+#     gets handed to the LLM afterwards (in retrieve()/answer_with_context) --
+#     unlike metadata_list below, which never touches the LLM at all.
+# ---------------------------------------------------------
+def metadata_question_search(where, collection, parent_collection):
+    if where is None:
+        return []
+
+    matched = collection.get(where=where, include=["documents", "metadatas"])
+
+    by_source = {}
+    for doc_id, doc, meta in zip(matched["ids"], matched["documents"], matched["metadatas"]):
+        source = meta["source"]
+        if source not in by_source:
+            by_source[source] = {"id": doc_id, "text": doc, "metadata": meta}
+
+    parent_ids = [rec["metadata"]["parent_id"] for rec in by_source.values() if "parent_id" in rec["metadata"]]
+    if not parent_ids:
+        return list(by_source.values())
+
+    parents = parent_collection.get(ids=parent_ids, include=["documents", "metadatas"])
+    parent_map = {pid: (doc, meta) for pid, doc, meta in zip(parents["ids"], parents["documents"], parents["metadatas"])}
+
+    records = []
+    for rec in by_source.values():
+        pid = rec["metadata"].get("parent_id")
+        if pid in parent_map:
+            doc, meta = parent_map[pid]
+            records.append({"id": pid, "text": doc, "metadata": meta})
+        else:
+            records.append(rec)
+    return records
+
+
+# ---------------------------------------------------------
+# 4g-4b. Strategy for "metadata_list": a pure structured-database lookup.
+#     NEVER calls collection.query(), NEVER generates embeddings, NEVER
+#     runs BM25, and NEVER expands to parent chunks -- listing questions
+#     ("Hangi boyalar su bazlıdır?") aren't nearest-neighbor questions or
+#     document Q&A, they're "which rows match this filter", so this stays
+#     entirely inside collection.get(where=...).
+#
+#     Every matching CHILD chunk is fetched, then deduplicated by product
+#     name (metadata["prop_ürün_adı"] -- NOT source/parent_id, since one
+#     product can have many chunks) so each product appears exactly once.
+# ---------------------------------------------------------
+def metadata_list_search(where, collection):
+    if where is None:
+        return []
+
+    matched = collection.get(where=where, include=["metadatas"])
+
+    by_product = {}
+    for meta in matched["metadatas"]:
+        product_name = meta.get("prop_ürün_adı")
+        if not product_name or product_name in by_product:
+            continue
+        by_product[product_name] = {
+            "product_name": product_name,
+            "source": meta.get("source"),
+            "page": meta.get("page_number"),
+        }
+
+    return list(by_product.values())
+
+
+# ---------------------------------------------------------
+# 4g-4c. Generic answer formatter for "metadata_list". Never sent through
+#     the LLM and never hardcodes a property name -- the metadata database
+#     already contains the answer, so we just render it directly.
+#
+#     Works for ANY property: build_metadata_list_answer(products, "Su bazlı")
+#     and build_metadata_list_answer(products, "VOC uyumlu") both produce
+#     the same "<display_property> ürünler:\n\n• Product\n• Product" shape.
+# ---------------------------------------------------------
+def build_metadata_list_answer(products, display_property):
+    label = display_property or "Eşleşen"
+
+    if not products:
+        return f"{label} ürün bulunamadı."
+
+    lines = [f"{label} ürünler:", ""]
+    for product in sorted(products, key=lambda p: p["product_name"]):
+        lines.append(f"• {product['product_name']}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------
+# 4g-5. Strategy for "comparison": one representative PARENT chunk per
+#     referenced product, fetched directly by `source` -- no nearest-
+#     neighbor ranking involved, so every named product is guaranteed a
+#     slot instead of competing for it.
+# ---------------------------------------------------------
+def comparison_search(products, collection, parent_collection):
+    records = []
+    for source in products:
+        matched = collection.get(where={"source": {"$eq": source}}, limit=1, include=["documents", "metadatas"])
+        if not matched["ids"]:
+            continue
+        child_meta = matched["metadatas"][0]
+        parent_id = child_meta.get("parent_id")
+        if parent_id:
+            parents = parent_collection.get(ids=[parent_id], include=["documents", "metadatas"])
+            if parents["ids"]:
+                records.append({"id": parent_id, "text": parents["documents"][0], "metadata": parents["metadatas"][0]})
+                continue
+        records.append({"id": matched["ids"][0], "text": matched["documents"][0], "metadata": child_meta})
+    return records
 
 
 # ---------------------------------------------------------
@@ -352,8 +654,6 @@ def build_context_parent_child(records, parent_collection):
     parents = parent_collection.get(ids=unique_parent_ids, include=["documents", "metadatas"])
     parent_pages = [m["page_number"] for m in parents["metadatas"]]
 
-    print(unique_parent_ids)
-    print(parents["ids"])
 
     parent_map = {
         pid: (doc, meta)
@@ -383,28 +683,96 @@ def build_context_parent_child(records, parent_collection):
 
 
 # ---------------------------------------------------------
+# 4i-2. Context builder C: "generic" -- for records that are already the
+#     final thing to show (parent chunks from metadata_question/comparison,
+#     or deduped child chunks from semantic_qa). No parent expansion,
+#     no dense/sparse score assumptions.
+# ---------------------------------------------------------
+def build_context_generic(records):
+    pages = [r["metadata"].get("page_number") for r in records]
+    context = "\n\n".join(
+        f"Source: {r['metadata']['source']}\n(Page {r['metadata'].get('page_number')}): {r['text']}"
+        for r in records
+    )
+    return context, pages
+
+
+# ---------------------------------------------------------
+# 4i-3. Intent-routed retrieval entry point. Classifies the question
+#     first, THEN picks the retrieval strategy that actually fits it --
+#     this is what replaces "always run vector search" as the default.
+#
+#     Returns (intent, context, pages, records, direct_answer).
+#     `direct_answer` is None for every intent except "metadata_list",
+#     where it's the final answer string already generated in Python --
+#     the caller must use it as-is and must NOT send it to the LLM.
+# ---------------------------------------------------------
+def retrieve(user_question, collection, parent_collection, bm25_index):
+    intent, products = classify_intent(user_question)
+    search_query, where, display_property = rewrite_query(user_question)
+
+    if intent == "comparison" and products:
+        records = comparison_search(products, collection, parent_collection)
+        context, pages = build_context_generic(records)
+        return intent, context, pages, records, None
+
+    if intent == "metadata_list" and where is not None:
+        products_matched = metadata_list_search(where, collection)
+        direct_answer = build_metadata_list_answer(products_matched, display_property)
+        # context/pages are built too (for the debug print + consistent
+        # return shape) but they're never handed to an LLM for this intent.
+        context, pages = build_context_generic([
+            {
+                "id": p["product_name"],
+                "text": p["product_name"],
+                "metadata": {"source": p["source"], "page_number": p["page"]},
+            }
+            for p in products_matched
+        ])
+        return intent, context, pages, products_matched, direct_answer
+
+    if intent == "metadata_question" and where is not None:
+        records = metadata_question_search(where, collection, parent_collection)
+        context, pages = build_context_generic(records)
+        return intent, context, pages, records, None
+
+    # Fallback net: "comparison" with no products matched, or
+    # "metadata_list"/"metadata_question" with no extractable filter,
+    # all degrade to semantic_qa rather than returning empty-handed.
+    intent = "semantic_qa"
+    records = hybrid_search(
+        search_query, collection, bm25_index,
+        final_n=SEMANTIC_QA_CANDIDATE_K, where=where,
+        vector_top_k=SEMANTIC_QA_CANDIDATE_K, bm25_top_k=SEMANTIC_QA_CANDIDATE_K,
+    )
+    records = dedupe_by_parent(records, keep_n=FINAL_TOP_K)
+    context, pages = build_context_parent_child(records, parent_collection)
+    return intent, context, pages, records, None
+
+
+# ---------------------------------------------------------
 # 4j. Mode dispatch (switch/case via match statement).
 #     Runs the right retriever + the right context builder for a mode
 #     and returns (context, pages, records, elapsed_seconds).
 # ---------------------------------------------------------
-def run_mode(mode, user_question, collection, parent_collection, bm25_index):
+def run_mode(mode, user_question, collection, parent_collection, bm25_index, where=None):
     start = time.perf_counter()
 
     match mode:
         case "semantic":
-            records = semantic_search(user_question, collection, final_n=FINAL_TOP_K)
+            records = semantic_search(user_question, collection, final_n=FINAL_TOP_K, where=where)
             context, pages = build_context(records)
 
         case "semantic_parent_child":
-            records = semantic_search(user_question, collection, final_n=FINAL_TOP_K)
+            records = semantic_search(user_question, collection, final_n=FINAL_TOP_K, where=where)
             context, pages = build_context_parent_child(records, parent_collection)
 
         case "hybrid":
-            records = hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K)
+            records = hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K, where=where)
             context, pages = build_context(records)
 
         case "hybrid_parent_child":
-            records = hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K)
+            records = hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K, where=where)
             context, pages = build_context_parent_child(records, parent_collection)
 
         case _:
@@ -498,18 +866,26 @@ def main():
             continue
 
         user_question = raw_input_text
-        context, pages, records, elapsed = run_mode(
-            SEARCH_MODE, user_question, collection, parent_collection, bm25_index
-        )
+        start = time.perf_counter()
+        intent, context, pages, records, direct_answer = retrieve(user_question, collection, parent_collection, bm25_index)
+        elapsed = time.perf_counter() - start
 
+        print(f"   [intent] {intent}")
         print(context)
-        answer = answer_with_context(user_question, context)
+
+        # metadata_list already has its final answer generated in Python --
+        # the database already contains the answer, so it never touches the LLM.
+        answer = direct_answer if direct_answer is not None else answer_with_context(user_question, context)
 
         print("\n--- Answer ---")
         print(answer)
-        print(f"(Mode: {SEARCH_MODE} | retrieval time: {elapsed:.3f}s | Sources: page(s) {sorted(set(pages))})\n")
+        shown_pages = sorted(set(p for p in pages if p is not None))
+        print(f"(Intent: {intent} | retrieval time: {elapsed:.3f}s | Sources: page(s) {shown_pages})\n")
         for r in records:
-            print(r["metadata"]["parent_id"])
+            if "metadata" in r:
+                print(r["metadata"].get("parent_id", r["id"]))
+            else:
+                print(r.get("product_name"))
 
 # ---------------------------------------------------------
 # 6. Compare all 4 modes side by side on the same question
@@ -517,10 +893,14 @@ def main():
 def compare_all_modes(user_question, collection, parent_collection, bm25_index):
     print(f"\n=== Comparing all 4 modes for: {user_question!r} ===\n")
 
+    search_query, where, _display_property = rewrite_query(user_question)
+    if where:
+        print(f"   [rewrite] search_query={search_query!r} where={where}")
+
     results = {}
     for mode in VALID_MODES:
         context, pages, records, elapsed = run_mode(
-            mode, user_question, collection, parent_collection, bm25_index
+            mode, search_query, collection, parent_collection, bm25_index, where=where
         )
         answer = answer_with_context(user_question, context)
         results[mode] = {
