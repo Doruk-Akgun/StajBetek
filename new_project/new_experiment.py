@@ -24,6 +24,13 @@ PDF_FILES =["TDS_AQUALUX.pdf",
 
 PDF_PATHS = [os.path.join(DATASET_PATH, file) for file in PDF_FILES]
 
+PRODUCT_NAMES = [
+    "AquaLux",
+    "Exxen Mat",
+    "Momento Plastix",
+    "WoodMaXX Wood Stain Dekoratif Ahşap Verniği",
+    "Momento Silan",
+]
 
 CHROMA_DB_PATH = "./paint_db"
 COLLECTION_NAME = "test6"
@@ -269,6 +276,7 @@ def reciprocal_rank_fusion(ranked_id_lists, k=RRF_K):
 #     only retrieval uses the rewritten form.
 # ---------------------------------------------------------
 _FILTERABLE_FIELDS = """- source: exact PDF filename, one of {files}
+- prop_ürün_adı: exact product name
 - prop_su_bazlı: true / false
 - prop_voc_uyumlu: true / false
 - prop_kullanım_alanı: "iç cephe" or "dış cephe"
@@ -279,25 +287,36 @@ _FILTERABLE_FIELDS = """- source: exact PDF filename, one of {files}
 
 
 def rewrite_query(user_question):
-    """Returns (search_query, where, display_property). `where` is a
-    Chroma-compatible filter dict, or None if the LLM found nothing
-    clearly filterable -- in that case retrieval behaves exactly as
-    before (unfiltered). `display_property` is a short, human-readable
-    label (in the question's own language) for the main filtered
-    attribute, e.g. "Su bazlı" or "VOC uyumlu" -- it's only consumed by
-    the metadata_list formatter and is "" when nothing was filterable."""
-    system_prompt = f"""You rewrite user questions for a product-datasheet search engine and extract metadata filters.
+    """Returns (search_query, where, display_property, requested_property)."""
+    system_prompt = f"""You rewrite user questions for a product-datasheet search engine and split them into two independent parts: a FILTER and a LOOKUP.
 
-Available metadata fields you may filter on (use these exact key names):
+Available fields:
 {_FILTERABLE_FIELDS}
 
+For ANY field in this list, a question relates to it in one of two ways -- decide which, independently, for every field the question touches:
+
+1. FILTER (goes in "filters"): the question already STATES the value for that field, and wants results matching it.
+   - "su bazlı ürünler" -> question states the value (true) for prop_su_bazlı -> filter
+   - "Momento Silan'ın ..." / "AquaLux ..." -> question states a value (the product name) for prop_ürün_adı -> filter
+   - A named product mentioned anywhere in the question is ALWAYS a filter on prop_ürün_adı, even if the rest of the question is a lookup.
+
+2. LOOKUP (goes in "requested_property"): the question is ASKING for that field's value -- the value is exactly what's unknown/wanted, so it must never appear in "filters".
+   - "... depolama süresi nedir?" -> the value of prop_depolama_süresi is unknown and wanted -> requested_property, NOT a filter
+   - "... kaç m2'ye yeter?" -> prop_sarfiyat_min/max is unknown and wanted -> requested_property
+   - "... su bazlı mı?" -> could go either way depending on phrasing; if it's a yes/no question about ONE named product, treat prop_su_bazlı as requested_property (the answer true/false is what's wanted), and put the product name in filters instead.
+
+Rule of thumb: a field name is a FILTER only if a concrete value for it is already given in the question. If you would have to guess, invent, or leave it null, it is NOT a filter -- it belongs in "requested_property" (or is simply irrelevant).
+
+NEVER put a field in "filters" with value null, "", "?", or any placeholder. An unknown value is not a filter.
+
+At most one field goes in "requested_property" -- the single thing the question is actually asking for. Leave it "" if the question doesn't ask for a specific field's value (e.g. it's a pure filter/list question, or unrelated to these fields).
+
 Respond with ONLY minified JSON, no prose, no markdown fences, in exactly this shape:
-{{"search_query": "<cleaned up, keyword-rich version of the question, same language as the question>", "filters": {{"field_name": value}}, "display_property": "<short human-readable label, same language as the question, naming the main filtered property, e.g. 'Su bazlı' or 'VOC uyumlu'; empty string if nothing is filterable>"}}
+{{"search_query": "<cleaned up, keyword-rich version of the question, same language as the question>", "filters": {{"field_name": value}}, "requested_property": "<one prop_ field name, or empty string>", "display_property": "<short human-readable label, same language as the question, naming the main field involved -- the requested_property if set, otherwise the main filter; empty string if neither applies>"}}
 
 Rules:
-- Only include a field in "filters" if the question CLEARLY states it (don't guess).
 - For a numeric range like "10 m2'den az sarfiyatlı" use the operator form: {{"prop_sarfiyat_max": {{"$lte": 10}}}}.
-- If nothing is filterable, use "filters": {{}} and "display_property": "".
+- If nothing is filterable, use "filters": {{}}.
 """
     user_prompt = f"User question: {user_question}"
 
@@ -310,11 +329,19 @@ Rules:
         search_query = parsed.get("search_query") or user_question
         filters = parsed.get("filters") or {}
         display_property = parsed.get("display_property") or ""
+        requested_property = parsed.get("requested_property") or ""
+        question_lower = user_question.lower()
+        # Only add a product filter if one doesn't already exist
+        if "prop_ürün_adı" not in filters:
+            for product in PRODUCT_NAMES:
+                if product.lower() in question_lower:
+                    filters["prop_ürün_adı"] = product
+                    break
     except Exception as e:
         print(f"   [rewrite_query] falling back to raw question ({e})")
-        search_query, filters, display_property = user_question, {}, ""
+        search_query, filters, display_property, requested_property = user_question, {}, "", ""
 
-    return search_query, _filters_to_where(filters), display_property
+    return search_query, _filters_to_where(filters), display_property, requested_property
 
 
 def _filters_to_where(filters):
@@ -446,24 +473,78 @@ def classify_intent(user_question):
     intent is one of "semantic_qa" / "metadata_list" / "metadata_question" / "comparison".
     products is only populated (and only used) when intent == "comparison" --
     exact filenames from PDF_FILES that the question refers to."""
-    system_prompt = f"""Classify the user's question into exactly one intent for a product-datasheet search system.
+    system_prompt = f"""Classify the user's question into exactly one intent for a product datasheet search system.
 
-Intents:
-- "semantic_qa": asks about a specific descriptive detail of ONE product that is NOT one of the structured filter fields below (e.g. drying time, coverage, storage instructions, application steps, "what is X").
-  Example: "What is AquaLux drying time?" -> semantic_qa
-- "metadata_list": asks to LIST or FILTER products ACROSS THE WHOLE CATALOG by a shared structured attribute (su bazlı, VOC uyumlu, kullanım alanı, doku, etc.).
-  Example: "Which paints are water based?" -> metadata_list
-- "metadata_question": asks a yes/no or short factual question about ONE named product's structured attribute (su bazlı, VOC uyumlu, kullanım alanı, doku, etc.).
-  Example: "AquaLux su bazlı mı?" -> metadata_question
-- "comparison": asks to compare two or more NAMED products against each other.
-  Example: "Compare AquaLux and Momento Plastix" -> comparison
+Structured metadata fields:
+{_FILTERABLE_FIELDS}
 
-Known product files: {PDF_FILES}
+Use these definitions:
 
-Respond with ONLY minified JSON, no prose, no markdown fences, in exactly this shape:
-{{"intent": "semantic_qa" | "metadata_list" | "metadata_question" | "comparison", "products": ["<exact filename from the known list>", ...]}}
+1. "metadata_question"
+Use this when the question asks for the value of one structured metadata field for one specific product.
 
-"products" must only contain exact filenames from the known list above, matched from whatever product names/brands the question mentions. Leave it as [] unless intent is "comparison".
+The answer can be obtained directly from the structured metadata without reading document text.
+
+Examples:
+- "AquaLux su bazlı mı?"
+- "Momento Silan depolama süresi nedir?"
+- "Momento Plus son kuruma süresi kaç saat?"
+- "Momento Plastix sarfiyatı nedir?"
+- "AquaLux VOC uyumlu mu?"
+- "Momento Silan hangi kullanım alanı için uygundur?"
+
+2. "metadata_list"
+Use this when the question asks to find, list, or filter multiple products according to one or more structured metadata fields.
+
+Examples:
+- "Hangi boyalar su bazlı?"
+- "VOC uyumlu ürünleri listele."
+- "Mat boyaları göster."
+- "İç cephe boyalarını listele."
+
+3. "comparison"
+Use this when the user asks to compare two or more named products.
+
+Examples:
+- "Compare AquaLux and Momento Plastix."
+- "Momento Silan ile AquaLux arasındaki fark nedir?"
+
+4. "semantic_qa"
+Use this only if the answer CANNOT be obtained directly from the structured metadata fields.
+
+These questions require reading or understanding the document text itself.
+
+Examples:
+- application instructions
+- surface preparation
+- explanatory paragraphs
+- recommendations
+- warnings
+- advantages
+- limitations
+- any descriptive information not represented by the structured metadata
+
+Decision rule:
+
+If the answer is contained in one of the structured metadata fields listed above:
+- one product -> metadata_question
+- multiple products -> metadata_list
+
+Otherwise:
+- semantic_qa
+
+Known product files:
+{PDF_FILES}
+
+Respond with ONLY minified JSON in exactly this format:
+
+{{"intent":"semantic_qa"|"metadata_list"|"metadata_question"|"comparison","products":["<exact filename>",...]}}
+
+Rules:
+- "products" must contain ONLY exact filenames from the known product list.
+- Populate "products" ONLY for comparison.
+- Otherwise return [].
+- Never return explanations or markdown.
 """
     user_prompt = f"User question: {user_question}"
 
@@ -598,6 +679,22 @@ def build_metadata_list_answer(products, display_property):
         lines.append(f"• {product['product_name']}")
     return "\n".join(lines)
 
+def metadata_question_lookup(where, requested_property, collection):
+    if where is None or not requested_property:
+        return None
+    matched = collection.get(where=where, limit=1, include=["metadatas"])
+    if not matched["ids"]:
+        return None
+    metadata = matched["metadatas"][0]
+
+    value = metadata.get(requested_property)
+
+    unit = metadata.get(f"{requested_property}_birimi")
+
+    if unit is not None:
+        return f"{value} {unit}"
+
+    return value
 
 # ---------------------------------------------------------
 # 4g-5. Strategy for "comparison": one representative PARENT chunk per
@@ -709,8 +806,7 @@ def build_context_generic(records):
 # ---------------------------------------------------------
 def retrieve(user_question, collection, parent_collection, bm25_index):
     intent, products = classify_intent(user_question)
-    search_query, where, display_property = rewrite_query(user_question)
-
+    search_query, where, display_property, requested_property = rewrite_query(user_question)
     if intent == "comparison" and products:
         records = comparison_search(products, collection, parent_collection)
         context, pages = build_context_generic(records)
@@ -730,6 +826,12 @@ def retrieve(user_question, collection, parent_collection, bm25_index):
             for p in products_matched
         ])
         return intent, context, pages, products_matched, direct_answer
+
+    if intent == "metadata_question" and requested_property:
+        value = metadata_question_lookup(where, requested_property, collection)
+        if value is not None:
+            direct_answer = f"{display_property or requested_property}: {value}"
+            return intent, "", [], [], direct_answer
 
     if intent == "metadata_question" and where is not None:
         records = metadata_question_search(where, collection, parent_collection)
@@ -871,7 +973,7 @@ def main():
         elapsed = time.perf_counter() - start
 
         print(f"   [intent] {intent}")
-        print(context)
+        
 
         # metadata_list already has its final answer generated in Python --
         # the database already contains the answer, so it never touches the LLM.
@@ -893,7 +995,7 @@ def main():
 def compare_all_modes(user_question, collection, parent_collection, bm25_index):
     print(f"\n=== Comparing all 4 modes for: {user_question!r} ===\n")
 
-    search_query, where, _display_property = rewrite_query(user_question)
+    search_query, where, _display_property, _requested_property = rewrite_query(user_question)
     if where:
         print(f"   [rewrite] search_query={search_query!r} where={where}")
 
