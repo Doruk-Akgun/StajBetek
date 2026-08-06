@@ -49,6 +49,18 @@ BM25_TOP_K = 15
 FINAL_TOP_K = 5
 RRF_K = 60  # standard RRF damping constant
 
+# Confidence gating for similarity-search results (semantic / hybrid /
+# semantic_qa). Confidence is a 0..1 score derived from the retrieval
+# signals a record actually carries (see compute_confidence()).
+#   score <  CONFIDENCE_DROP_THRESHOLD -> discarded, never shown to the LLM
+#   score <  CONFIDENCE_LOW_THRESHOLD  -> kept, but tagged "low confidence"
+#   score >= CONFIDENCE_LOW_THRESHOLD  -> kept, shown normally
+# Exact metadata matches (metadata_question/list/comparison) never go
+# through this gate -- they're filter lookups, not nearest-neighbor
+# guesses, so they're always confidence 1.0.
+CONFIDENCE_DROP_THRESHOLD = 0.35
+CONFIDENCE_LOW_THRESHOLD = 0.55
+
 # Widened candidate pool for "semantic_qa" intent: retrieve more, then
 # collapse to one chunk per parent so a single document can't occupy
 # every slot before we even get to pick the best FINAL_TOP_K.
@@ -267,6 +279,104 @@ def reciprocal_rank_fusion(ranked_id_lists, k=RRF_K):
     return [doc_id for doc_id, _ in fused]
 
 
+# ---------------------------------------------------------------------------
+# 4e-3. Confidence scoring -- turns whatever similarity signal a record
+#     already carries into one comparable 0..1 number, then gates on it.
+# ---------------------------------------------------------------------------
+
+def _dense_similarity(distance):
+    """Chroma cosine distance (0 = identical) -> a 0..1 similarity.
+    Clamped because a rare distance > 1 (near-opposite embeddings) would
+    otherwise produce a negative "confidence", which isn't meaningful."""
+    if distance is None:
+        return None
+    return max(0.0, min(1.0, 1.0 - distance))
+
+
+def _normalize_sparse_scores(records):
+    """Min-max normalizes BM25 scores across the CURRENT record batch
+    into 0..1. Raw BM25 scores have no fixed scale across queries/corpora
+    (they depend on term rarity in whatever's indexed), so they can only
+    be compared relative to the other candidates retrieved this query --
+    never thresholded against an absolute number on their own."""
+    scored = [(id(r), r["sparse_score"]) for r in records if r.get("sparse_score") is not None]
+    if not scored:
+        return {}
+    values = [v for _, v in scored]
+    lo, hi = min(values), max(values)
+    if hi - lo < 1e-9:
+        return {rid: 1.0 for rid, _ in scored}
+    return {rid: (v - lo) / (hi - lo) for rid, v in scored}
+
+
+def compute_confidence(records):
+    """Attaches `confidence` (0..1 float) and `confidence_label`
+    ("high"/"low"/"drop") to every record, in place. Uses whichever
+    signal that record actually has:
+
+    - "distance" (flat semantic_search records) -> dense similarity alone.
+    - "dense_distance" (+ optional "sparse_score", hybrid_search records)
+      -> a weighted blend, dense weighted higher since it's on an
+      absolute query-independent scale while BM25 is only meaningful
+      relative to this batch.
+    - neither key present (metadata_question/list/comparison records,
+      which were fetched by exact filter via collection.get(), never
+      ranked by similarity) -> confidence = 1.0.
+
+    Returns `records` (same list, mutated) so callers can chain this
+    into a filter step without an extra variable.
+    """
+    sparse_norm = _normalize_sparse_scores(records)
+    for r in records:
+        dense_dist = r.get("distance", r.get("dense_distance"))
+        dense_sim = _dense_similarity(dense_dist)
+        sparse_sim = sparse_norm.get(id(r))
+
+        if dense_sim is None and sparse_sim is None:
+            confidence = 1.0  # exact metadata match, not a similarity guess
+        elif dense_sim is not None and sparse_sim is not None:
+            confidence = 0.7 * dense_sim + 0.3 * sparse_sim
+        elif dense_sim is not None:
+            confidence = dense_sim
+        else:
+            confidence = sparse_sim
+
+        r["confidence"] = round(confidence, 4)
+        if confidence < CONFIDENCE_DROP_THRESHOLD:
+            r["confidence_label"] = "drop"
+        elif confidence < CONFIDENCE_LOW_THRESHOLD:
+            r["confidence_label"] = "low"
+        else:
+            r["confidence_label"] = "high"
+    return records
+
+
+def apply_confidence_thresholds(records, verbose=True):
+    """Runs compute_confidence, then drops every record scored "drop".
+    "low" records are kept (they still get shown to the LLM, just
+    tagged -- see _confidence_tag) -- only records too unrelated to be
+    worth showing at all are removed here."""
+    compute_confidence(records)
+    kept = [r for r in records if r["confidence_label"] != "drop"]
+    if verbose:
+        dropped = len(records) - len(kept)
+        if dropped:
+            print(f"   [confidence] dropped {dropped} chunk(s) below {CONFIDENCE_DROP_THRESHOLD} confidence")
+    return kept
+
+
+def _confidence_tag(record):
+    """Short Turkish tag prepended to a source excerpt's text when its
+    confidence is "low", so answer_with_context's LLM sees the caveat
+    inline with the text it's judging -- an out-of-band field would be
+    invisible to a system prompt that only ever receives the flattened
+    context string. Records with no confidence_label (exact metadata
+    matches) or "high" get no tag."""
+    if record.get("confidence_label") == "low":
+        return "[DÜŞÜK GÜVEN - bu alıntının soruyla ilişkisi zayıf olabilir] "
+    return ""
+
+
 # ---------------------------------------------------------
 # 4e-2. Query rewriting: ask the LLM to turn the raw user input into
 #     (a) a clean, keyword-rich string to embed/BM25-search with, and
@@ -286,37 +396,103 @@ _FILTERABLE_FIELDS = """- source: exact PDF filename, one of {files}
 - prop_ambalaj_boyutları: comma-separated package sizes, e.g. "2.5, 7.5, 15\"""".format(files=PDF_FILES)
 
 
-def rewrite_query(user_question):
-    """Returns (search_query, where, display_property, requested_property)."""
-    system_prompt = f"""You rewrite user questions for a product-datasheet search engine and split them into two independent parts: a FILTER and a LOOKUP.
+def _deterministic_filters(user_question):
+    """Regex backstop for the handful of structured fields whose Turkish
+    vocabulary is small and fixed enough to detect directly, without
+    relying on the LLM at all -- mirrors the same su_bazlı/voc_uyumlu/
+    kullanım_alanı/doku regexes pdf_extraction.py already uses at
+    ingestion time to pull these same values OUT of the PDFs, so the
+    query side and the extraction side agree on what these phrases mean.
 
-Available fields:
+    Local/small models can get "intent" right (an easy classification)
+    while still flubbing "filters" (a harder structured-extraction task)
+    in the very same call -- that's what caused intent="metadata_list"
+    with filters={} for "Su bazlı boyalar nelerdir?". This exists so
+    that failure mode can't happen for these specific fields regardless
+    of how the LLM call goes."""
+    q = user_question.lower()
+    filters = {}
+
+    if re.search(r"su\s*bazl[ıi]", q):
+        filters["prop_su_bazlı"] = True
+
+    if re.search(r"voc\s*uyumlu", q):
+        filters["prop_voc_uyumlu"] = True
+
+    kullanım_match = re.search(r"(iç\s*cephe|dış\s*cephe)", q)
+    if kullanım_match:
+        filters["prop_kullanım_alanı"] = re.sub(r"\s+", " ", kullanım_match.group(1)).strip()
+
+    # Most-specific-first, same ordering as pdf_extraction.py's doku regex,
+    # so "yarı mat" doesn't get swallowed by the bare "mat" alternative.
+    doku_match = re.search(
+        r"(lüks\s*parlak|yarı\s*parlak|tam\s*parlak|parlak|yarı\s*mat|tam\s*mat|mat)", q)
+    if doku_match:
+        filters["prop_doku"] = doku_match.group(1).strip()
+
+    return filters
+
+
+# ---------------------------------------------------------
+# 4e-4. analyze_query -- ONE LLM call that replaces the old separate
+#     classify_intent() + rewrite_query() pair.
+#
+#     Why merge them: the two used to reason about the same question
+#     independently, in separate calls with separate prompts, and could
+#     disagree. E.g. for "su bazlı boyalar": classify_intent correctly
+#     said "metadata_list", but rewrite_query's own (separate) pass came
+#     back with an empty filters dict -> where=None. retrieve()'s
+#     `if intent == "metadata_list" and where is not None` branch
+#     requires BOTH, so it was skipped, and the question silently fell
+#     through to the semantic_qa fallback net -- not a bug in either
+#     function individually, just two independent guesses that didn't
+#     line up.
+#
+#     Fix: one call, one JSON schema. The model extracts filters /
+#     requested_property FIRST, then is explicitly told to derive
+#     "intent" from those SAME extracted fields (not re-decide it from
+#     scratch), so the two parts of the answer can no longer contradict
+#     each other.
+# ---------------------------------------------------------
+def analyze_query(user_question):
+    """Returns (intent, products, search_query, where, display_property, requested_property)."""
+    system_prompt = f"""You analyze a user question for a product-datasheet search engine, in one pass. Extract filters/requested_property first, then derive "intent" from those SAME extracted fields so the two never contradict each other.
+
+Available structured metadata fields:
 {_FILTERABLE_FIELDS}
 
-For ANY field in this list, a question relates to it in one of two ways -- decide which, independently, for every field the question touches:
+STEP 1 -- for ANY field above the question touches, decide FILTER vs LOOKUP:
 
-1. FILTER (goes in "filters"): the question already STATES the value for that field, and wants results matching it.
+FILTER (goes in "filters"): the question already STATES the value for that field, and wants results matching it.
    - "su bazlı ürünler" -> question states the value (true) for prop_su_bazlı -> filter
-   - "Momento Silan'ın ..." / "AquaLux ..." -> question states a value (the product name) for prop_ürün_adı -> filter
-   - A named product mentioned anywhere in the question is ALWAYS a filter on prop_ürün_adı, even if the rest of the question is a lookup.
+   - "Momento Silan'ın ..." / "AquaLux ..." -> a named product anywhere in the question is ALWAYS a filter on prop_ürün_adı, even if the rest of the question is a lookup.
 
-2. LOOKUP (goes in "requested_property"): the question is ASKING for that field's value -- the value is exactly what's unknown/wanted, so it must never appear in "filters".
-   - "... depolama süresi nedir?" -> the value of prop_depolama_süresi is unknown and wanted -> requested_property, NOT a filter
+LOOKUP (goes in "requested_property"): the question is ASKING for that field's value -- the value is exactly what's unknown/wanted, so it must never appear in "filters".
+   - "... depolama süresi nedir?" -> prop_depolama_süresi is unknown and wanted -> requested_property, NOT a filter
    - "... kaç m2'ye yeter?" -> prop_sarfiyat_min/max is unknown and wanted -> requested_property
-   - "... su bazlı mı?" -> could go either way depending on phrasing; if it's a yes/no question about ONE named product, treat prop_su_bazlı as requested_property (the answer true/false is what's wanted), and put the product name in filters instead.
+   - "... su bazlı mı?" about ONE named product -> prop_su_bazlı is requested_property (the true/false answer is what's wanted), product name goes in filters instead.
 
-Rule of thumb: a field name is a FILTER only if a concrete value for it is already given in the question. If you would have to guess, invent, or leave it null, it is NOT a filter -- it belongs in "requested_property" (or is simply irrelevant).
+Rule of thumb: a field is a FILTER only if a concrete value for it is already given. If you'd have to guess/invent/leave it null, it's NOT a filter -- it's requested_property (or simply irrelevant).
+NEVER put a field in "filters" with value null, "", "?", or a placeholder.
+At most one field goes in "requested_property". Leave it "" if the question doesn't ask for a specific field's value.
 
-NEVER put a field in "filters" with value null, "", "?", or any placeholder. An unknown value is not a filter.
+STEP 2 -- decide "intent", using ONLY the filters/requested_property you just extracted (don't re-derive them separately, don't second-guess step 1):
+- "comparison": the question names 2+ known products AND asks to compare them (e.g. "Compare AquaLux and Momento Plastix", "X ile Y arasındaki fark nedir?"). Put those exact filenames in "products".
+- "metadata_question": requested_property is set, for one specific/named product.
+- "metadata_list": filters contain at least one non-product structured field (prop_su_bazlı, prop_voc_uyumlu, prop_kullanım_alanı, prop_doku, a sarfiyat/depolama/ambalaj range, etc.) and requested_property is empty -- a find/list/filter-multiple-products question, e.g. "Hangi boyalar su bazlı?", "Mat boyaları göster.", "VOC uyumlu ürünleri listele."
+- "semantic_qa": everything else -- filters and requested_property came back empty or don't fit the cases above, or the question needs the actual document text (application instructions, surface prep, explanations, warnings, advantages/limitations, anything not represented by a structured field).
 
-At most one field goes in "requested_property" -- the single thing the question is actually asking for. Leave it "" if the question doesn't ask for a specific field's value (e.g. it's a pure filter/list question, or unrelated to these fields).
+Known product files:
+{PDF_FILES}
 
 Respond with ONLY minified JSON, no prose, no markdown fences, in exactly this shape:
-{{"search_query": "<cleaned up, keyword-rich version of the question, same language as the question>", "filters": {{"field_name": value}}, "requested_property": "<one prop_ field name, or empty string>", "display_property": "<short human-readable label, same language as the question, naming the main field involved -- the requested_property if set, otherwise the main filter; empty string if neither applies>"}}
+{{"intent": "semantic_qa"|"metadata_list"|"metadata_question"|"comparison", "products": ["<exact filename>", ...], "search_query": "<cleaned up, keyword-rich version of the question, same language as the question>", "filters": {{"field_name": value}}, "requested_property": "<one prop_ field name, or empty string>", "display_property": "<short human-readable label, same language as the question -- the requested_property if set, otherwise the main filter; empty string if neither applies>"}}
 
 Rules:
+- "products" must contain ONLY exact filenames from the known product list, and ONLY when intent is "comparison" (empty list otherwise).
 - For a numeric range like "10 m2'den az sarfiyatlı" use the operator form: {{"prop_sarfiyat_max": {{"$lte": 10}}}}.
 - If nothing is filterable, use "filters": {{}}.
+- Never return explanations or markdown.
 """
     user_prompt = f"User question: {user_question}"
 
@@ -326,22 +502,57 @@ Rules:
         if cleaned[:4].lower() == "json":
             cleaned = cleaned[4:].strip()
         parsed = json.loads(cleaned)
+
+        intent = parsed.get("intent")
+        if intent not in ("semantic_qa", "metadata_list", "metadata_question", "comparison"):
+            raise ValueError(f"unexpected intent {intent!r}")
+
+        products = [p for p in (parsed.get("products") or []) if p in PDF_FILES]
         search_query = parsed.get("search_query") or user_question
         filters = parsed.get("filters") or {}
         display_property = parsed.get("display_property") or ""
         requested_property = parsed.get("requested_property") or ""
+
+        # Deterministic backstops: fill in gaps the LLM's own extraction
+        # missed. setdefault so a value the model DID get right (e.g. a
+        # numeric range, or a filter it correctly chose to leave out
+        # because it's actually the requested_property) is never
+        # overridden by these.
         question_lower = user_question.lower()
-        # Only add a product filter if one doesn't already exist
         if "prop_ürün_adı" not in filters:
             for product in PRODUCT_NAMES:
                 if product.lower() in question_lower:
                     filters["prop_ürün_adı"] = product
                     break
+        for key, value in _deterministic_filters(user_question).items():
+            filters.setdefault(key, value)
+
+        # If the model said "semantic_qa" but a deterministic filter
+        # backstop above found something concrete AND nothing was asked
+        # as a lookup, this is actually a metadata_list question the
+        # model just missed the structured hook for (the exact failure
+        # mode that motivated this backstop) -- re-route it rather than
+        # sending a perfectly filterable question through embeddings.
+        if intent == "semantic_qa" and filters and not requested_property:
+            intent = "metadata_list"
+
     except Exception as e:
-        print(f"   [rewrite_query] falling back to raw question ({e})")
+        print(f"   [analyze_query] falling back to semantic_qa ({e})")
+        intent, products = "semantic_qa", []
         search_query, filters, display_property, requested_property = user_question, {}, "", ""
 
-    return search_query, _filters_to_where(filters), display_property, requested_property
+        # Even on a total parse/call failure, don't lose an obvious filter:
+        # deterministic detection still runs, and can upgrade the intent.
+        question_lower = user_question.lower()
+        for product in PRODUCT_NAMES:
+            if product.lower() in question_lower:
+                filters["prop_ürün_adı"] = product
+                break
+        filters.update(_deterministic_filters(user_question))
+        if filters:
+            intent = "metadata_list"
+
+    return intent, products, search_query, _filters_to_where(filters), display_property, requested_property
 
 
 def _filters_to_where(filters):
@@ -460,109 +671,6 @@ def hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K, wh
     }
 
     return [id_to_record[doc_id] for doc_id in top_ids if doc_id in id_to_record]
-
-
-# ---------------------------------------------------------
-# 4g-2. Intent classification -- routes a question to one of three
-#     retrieval strategies BEFORE any search happens. This is what fixes
-#     "Hangi boyalar su bazlıdır?": that's a list-all-matches question,
-#     not a nearest-neighbor question, so it must never touch embeddings.
-# ---------------------------------------------------------
-def classify_intent(user_question):
-    """Returns (intent, products).
-    intent is one of "semantic_qa" / "metadata_list" / "metadata_question" / "comparison".
-    products is only populated (and only used) when intent == "comparison" --
-    exact filenames from PDF_FILES that the question refers to."""
-    system_prompt = f"""Classify the user's question into exactly one intent for a product datasheet search system.
-
-Structured metadata fields:
-{_FILTERABLE_FIELDS}
-
-Use these definitions:
-
-1. "metadata_question"
-Use this when the question asks for the value of one structured metadata field for one specific product.
-
-The answer can be obtained directly from the structured metadata without reading document text.
-
-Examples:
-- "AquaLux su bazlı mı?"
-- "Momento Silan depolama süresi nedir?"
-- "Momento Plus son kuruma süresi kaç saat?"
-- "Momento Plastix sarfiyatı nedir?"
-- "AquaLux VOC uyumlu mu?"
-- "Momento Silan hangi kullanım alanı için uygundur?"
-
-2. "metadata_list"
-Use this when the question asks to find, list, or filter multiple products according to one or more structured metadata fields.
-
-Examples:
-- "Hangi boyalar su bazlı?"
-- "VOC uyumlu ürünleri listele."
-- "Mat boyaları göster."
-- "İç cephe boyalarını listele."
-
-3. "comparison"
-Use this when the user asks to compare two or more named products.
-
-Examples:
-- "Compare AquaLux and Momento Plastix."
-- "Momento Silan ile AquaLux arasındaki fark nedir?"
-
-4. "semantic_qa"
-Use this only if the answer CANNOT be obtained directly from the structured metadata fields.
-
-These questions require reading or understanding the document text itself.
-
-Examples:
-- application instructions
-- surface preparation
-- explanatory paragraphs
-- recommendations
-- warnings
-- advantages
-- limitations
-- any descriptive information not represented by the structured metadata
-
-Decision rule:
-
-If the answer is contained in one of the structured metadata fields listed above:
-- one product -> metadata_question
-- multiple products -> metadata_list
-
-Otherwise:
-- semantic_qa
-
-Known product files:
-{PDF_FILES}
-
-Respond with ONLY minified JSON in exactly this format:
-
-{{"intent":"semantic_qa"|"metadata_list"|"metadata_question"|"comparison","products":["<exact filename>",...]}}
-
-Rules:
-- "products" must contain ONLY exact filenames from the known product list.
-- Populate "products" ONLY for comparison.
-- Otherwise return [].
-- Never return explanations or markdown.
-"""
-    user_prompt = f"User question: {user_question}"
-
-    try:
-        raw = ask_llm(system_prompt=system_prompt, user_prompt=user_prompt)
-        cleaned = raw.strip().strip("`")
-        if cleaned[:4].lower() == "json":
-            cleaned = cleaned[4:].strip()
-        parsed = json.loads(cleaned)
-        intent = parsed.get("intent")
-        products = [p for p in (parsed.get("products") or []) if p in PDF_FILES]
-        if intent not in ("semantic_qa", "metadata_list", "metadata_question", "comparison"):
-            raise ValueError(f"unexpected intent {intent!r}")
-    except Exception as e:
-        print(f"   [classify_intent] falling back to semantic_qa ({e})")
-        intent, products = "semantic_qa", []
-
-    return intent, products
 
 
 # ---------------------------------------------------------
@@ -725,7 +833,10 @@ def comparison_search(products, collection, parent_collection):
 # ---------------------------------------------------------
 def build_context(records):
     pages = [r["metadata"]["page_number"] for r in records]
-    context = "\n\n".join(f"Source: {r['metadata']['source']}\n(Page {r['metadata']['page_number']}): {r['text']}" for r in records)
+    context = "\n\n".join(
+        f"Source: {r['metadata']['source']}\n(Page {r['metadata']['page_number']}): {_confidence_tag(r)}{r['text']}"
+        for r in records
+    )
     for i, r in enumerate(records):
         print(f"\n===== Chunk {i+1} =====")
         print(f"Source: {r['metadata']['source']}")
@@ -736,6 +847,8 @@ def build_context(records):
             print(f"Dense distance: {r['dense_distance']:.4f}")
         if r.get("sparse_score") is not None:
             print(f"Sparse score: {r['sparse_score']:.4f}")
+        if r.get("confidence") is not None:
+            print(f"Confidence: {r['confidence']:.4f} ({r['confidence_label']})")
         print(r["text"])
     return context, pages
 
@@ -766,12 +879,13 @@ def build_context_parent_child(records, parent_collection):
     for record in records:
         pid = record["metadata"]["parent_id"]
         doc, meta = parent_map[pid]
+        tag = _confidence_tag(record)
 
         contexts.append(
             f"""Source: {meta['source']}
     Page: {meta['page_number']}
 
-    {doc}
+    {tag}{doc}
     """
         )
 
@@ -788,7 +902,7 @@ def build_context_parent_child(records, parent_collection):
 def build_context_generic(records):
     pages = [r["metadata"].get("page_number") for r in records]
     context = "\n\n".join(
-        f"Source: {r['metadata']['source']}\n(Page {r['metadata'].get('page_number')}): {r['text']}"
+        f"Source: {r['metadata']['source']}\n(Page {r['metadata'].get('page_number')}): {_confidence_tag(r)}{r['text']}"
         for r in records
     )
     return context, pages
@@ -805,8 +919,7 @@ def build_context_generic(records):
 #     the caller must use it as-is and must NOT send it to the LLM.
 # ---------------------------------------------------------
 def retrieve(user_question, collection, parent_collection, bm25_index):
-    intent, products = classify_intent(user_question)
-    search_query, where, display_property, requested_property = rewrite_query(user_question)
+    intent, products, search_query, where, display_property, requested_property = analyze_query(user_question)
     if intent == "comparison" and products:
         records = comparison_search(products, collection, parent_collection)
         context, pages = build_context_generic(records)
@@ -847,6 +960,11 @@ def retrieve(user_question, collection, parent_collection, bm25_index):
         final_n=SEMANTIC_QA_CANDIDATE_K, where=where,
         vector_top_k=SEMANTIC_QA_CANDIDATE_K, bm25_top_k=SEMANTIC_QA_CANDIDATE_K,
     )
+    # Gate on confidence BEFORE dedupe/truncation, over the wide
+    # candidate pool -- so a dropped low-confidence chunk simply lets
+    # the next-best parent take its slot in FINAL_TOP_K, instead of
+    # thresholding an already-final top-5 and silently shrinking it.
+    records = apply_confidence_thresholds(records)
     records = dedupe_by_parent(records, keep_n=FINAL_TOP_K)
     context, pages = build_context_parent_child(records, parent_collection)
     return intent, context, pages, records, None
@@ -863,18 +981,22 @@ def run_mode(mode, user_question, collection, parent_collection, bm25_index, whe
     match mode:
         case "semantic":
             records = semantic_search(user_question, collection, final_n=FINAL_TOP_K, where=where)
+            records = apply_confidence_thresholds(records)
             context, pages = build_context(records)
 
         case "semantic_parent_child":
             records = semantic_search(user_question, collection, final_n=FINAL_TOP_K, where=where)
+            records = apply_confidence_thresholds(records)
             context, pages = build_context_parent_child(records, parent_collection)
 
         case "hybrid":
             records = hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K, where=where)
+            records = apply_confidence_thresholds(records)
             context, pages = build_context(records)
 
         case "hybrid_parent_child":
             records = hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K, where=where)
+            records = apply_confidence_thresholds(records)
             context, pages = build_context_parent_child(records, parent_collection)
 
         case _:
@@ -898,6 +1020,13 @@ The user's input may be:
 - or a short phrase.
 
 If the input is not a complete question, treat it as a request to summarize or explain the matching information from the excerpts or return names of matching documents.
+
+Some excerpts are prefixed with "[DÜŞÜK GÜVEN - ...]" -- this means the
+retrieval system is not confident this excerpt actually matches the
+question. You may still use it, but hedge explicitly (e.g. "Bu konuda
+emin değilim, ancak..." / "Belgede bulunan bir ifadeye göre..." rather
+than stating it as settled fact). Never present a "DÜŞÜK GÜVEN" excerpt
+with the same certainty as an untagged one.
 
 If the excerpts contain the requested information:
 - answer clearly,
@@ -995,9 +1124,8 @@ def main():
 def compare_all_modes(user_question, collection, parent_collection, bm25_index):
     print(f"\n=== Comparing all 4 modes for: {user_question!r} ===\n")
 
-    search_query, where, _display_property, _requested_property = rewrite_query(user_question)
-    if where:
-        print(f"   [rewrite] search_query={search_query!r} where={where}")
+    intent, _products, search_query, where, _display_property, _requested_property = analyze_query(user_question)
+    print(f"   [analyze] intent={intent!r} search_query={search_query!r} where={where}")
 
     results = {}
     for mode in VALID_MODES:
