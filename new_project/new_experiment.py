@@ -447,8 +447,17 @@ def _detect_property_keyword(user_question):
     hint appears in the question, or None. Reuses the exact same
     keyword table _requested_property_is_plausible already used to
     sanity-check the LLM -- now it's the primary detector, not just a
-    validator."""
+    validator.
+
+    Detected product names are stripped out of the text FIRST. A
+    product's own name can accidentally contain a property word (e.g.
+    "Exxen Mat" contains "mat", which would otherwise be misread as a
+    doku/texture question even when the question is actually asking
+    about something else entirely, e.g. "Exxen mat litre başına kaç
+    metrekare boyanabilir" is a sarfiyat question, not a doku one)."""
     q = user_question.lower()
+    for _fname, name in _detect_products(user_question):
+        q = q.replace(name.lower(), " ")
     for field, keywords in _PROPERTY_KEYWORDS.items():
         if any(kw in q for kw in keywords):
             return field
@@ -463,13 +472,19 @@ def _deterministic_filters(user_question):
     ingestion time to pull these same values OUT of the PDFs, so the
     query side and the extraction side agree on what these phrases mean.
 
-    Local/small models can get "intent" right (an easy classification)
-    while still flubbing "filters" (a harder structured-extraction task)
-    in the very same call -- that's what caused intent="metadata_list"
-    with filters={} for "Su bazlı boyalar nelerdir?". This exists so
-    that failure mode can't happen for these specific fields regardless
-    of how the LLM call goes."""
+    Detected product names are stripped out FIRST, same as
+    _detect_property_keyword() -- otherwise a product name that happens
+    to contain a property word (e.g. "Exxen Mat" contains "mat") gets
+    misread as the user filtering/asking about that property, even when
+    they're just naming the product. Without this, a broad question like
+    "Exxen Mat ürününün özellikleri nedir?" spuriously picks up
+    prop_doku="mat" and gets routed to metadata_list instead of
+    semantic_qa.
+    """
     q = user_question.lower()
+    for _fname, name in _detect_products(user_question):
+        q = q.replace(name.lower(), " ")
+
     filters = {}
 
     if re.search(r"su\s*bazl[ıi]", q):
@@ -482,15 +497,12 @@ def _deterministic_filters(user_question):
     if kullanım_match:
         filters["prop_kullanım_alanı"] = re.sub(r"\s+", " ", kullanım_match.group(1)).strip()
 
-    # Most-specific-first, same ordering as pdf_extraction.py's doku regex,
-    # so "yarı mat" doesn't get swallowed by the bare "mat" alternative.
     doku_match = re.search(
         r"(lüks\s*parlak|yarı\s*parlak|tam\s*parlak|parlak|yarı\s*mat|tam\s*mat|mat)", q)
     if doku_match:
         filters["prop_doku"] = doku_match.group(1).strip()
 
     return filters
-
 
 # Lightweight keyword hints per lookup-able field, used to sanity-check
 # the LLM's OWN requested_property choice -- a model can name a real,
@@ -521,6 +533,8 @@ def _requested_property_is_plausible(requested_property, user_question):
     if not keywords:
         return False
     q = user_question.lower()
+    for _fname, name in _detect_products(user_question):
+        q = q.replace(name.lower(), " ")
     return any(kw in q for kw in keywords)
 
 
@@ -903,6 +917,13 @@ def build_metadata_list_answer(products, display_property):
     return "\n".join(lines)
 
 def metadata_question_lookup(where, requested_property, collection):
+    """Looks up a single structured field's value for the matched
+    product. For range-shaped fields -- stored by pdf_extraction.py as
+    sibling "<root>_min" / "<root>_max" keys sharing ONE "<root>_birimi"
+    unit key (never "<root>_min_birimi") -- this strips the _min/_max
+    suffix to find the right unit key, and merges both bounds into a
+    "min-max unit" answer instead of silently returning just one
+    arbitrary bound (e.g. "prop_sarfiyat_min" alone)."""
     if where is None or not requested_property:
         return None
     matched = collection.get(where=where, limit=1, include=["metadatas"])
@@ -910,13 +931,31 @@ def metadata_question_lookup(where, requested_property, collection):
         return None
     metadata = matched["metadatas"][0]
 
-    value = metadata.get(requested_property)
+    root, bound = requested_property, None
+    if root.endswith("_min"):
+        root, bound = root[:-4], "min"
+    elif root.endswith("_max"):
+        root, bound = root[:-4], "max"
 
-    unit = metadata.get(f"{requested_property}_birimi")
+    unit = metadata.get(f"{root}_birimi")
+    if unit is None:
+        # not actually a range field -- fall back to the naive pattern
+        unit = metadata.get(f"{requested_property}_birimi")
 
+    if bound is not None:
+        min_val = metadata.get(f"{root}_min")
+        max_val = metadata.get(f"{root}_max")
+        if min_val is not None and max_val is not None:
+            value = min_val if min_val == max_val else f"{min_val}-{max_val}"
+        else:
+            value = metadata.get(requested_property)
+    else:
+        value = metadata.get(requested_property)
+
+    if value is None:
+        return None
     if unit is not None:
         return f"{value} {unit}"
-
     return value
 
 # ---------------------------------------------------------
@@ -1146,7 +1185,8 @@ with the same certainty as an untagged one.
 If the excerpts contain the requested information:
 - answer clearly,
 - combine relevant excerpts when appropriate,
-- cite the document.
+- cite only the Source and Page information explicitly present in the provided excerpts.
+- Never invent URLs, hyperlinks, document locations, page numbers, section names, or citations.
 
 If the excerpts do not contain the requested information, reply exactly:
 
@@ -1217,7 +1257,7 @@ def main():
         elapsed = time.perf_counter() - start
 
         print(f"   [intent] {intent}")
-        
+
 
         # metadata_list already has its final answer generated in Python --
         # the database already contains the answer, so it never touches the LLM.
