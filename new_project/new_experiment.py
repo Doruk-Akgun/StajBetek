@@ -378,22 +378,81 @@ def _confidence_tag(record):
 
 
 # ---------------------------------------------------------
-# 4e-2. Query rewriting: ask the LLM to turn the raw user input into
-#     (a) a clean, keyword-rich string to embed/BM25-search with, and
-#     (b) any metadata filters it can confidently infer from the wording
-#     (e.g. "su bazlı ürünler" -> prop_su_bazlı: true). The ORIGINAL
-#     question is still what gets shown to the answering LLM later --
-#     only retrieval uses the rewritten form.
+# 4e-2. Deterministic query analysis.
+#
+#     Query REWRITING has been removed entirely: retrieval (embeddings +
+#     BM25) now always uses the user's original question text, verbatim.
+#     Nothing rewrites/expands it anymore -- `search_query` below is just
+#     `user_question` passed straight through, kept as a return value
+#     only so callers (retrieve(), compare_all_modes()) don't need to
+#     change.
+#
+#     Filter/intent extraction is now deterministic-first (regex/keyword
+#     rules over the question), reusing the same _deterministic_filters /
+#     _PROPERTY_KEYWORDS helpers the old LLM-assisted version already
+#     had. An LLM call only happens for the narrow slice of questions
+#     the rules genuinely can't disambiguate (see analyze_query below),
+#     and even then it returns just {intent, requested_property} -- no
+#     filters, no query rewriting, no field documentation in the prompt.
 # ---------------------------------------------------------
-_FILTERABLE_FIELDS = """- source: exact PDF filename, one of {files}
-- prop_ürün_adı: exact product name
-- prop_su_bazlı: true / false
-- prop_voc_uyumlu: true / false
-- prop_kullanım_alanı: "iç cephe" or "dış cephe"
-- prop_doku: e.g. "mat", "parlak", "yarı mat", "yarı parlak"
-- prop_sarfiyat_min / prop_sarfiyat_max: numbers (m²/Litre)
-- prop_depolama_süresi: number (depolama_süresi_birimi'ndeki birimde)
-- prop_ambalaj_boyutları: comma-separated package sizes, e.g. "2.5, 7.5, 15\"""".format(files=PDF_FILES)
+
+# Human-readable Turkish display label for each structured field, used
+# when a value is presented back to the user (metadata_list header,
+# metadata_question answer prefix). Mirrors what the old LLM prompt used
+# to invent on the fly via "display_property".
+_PROPERTY_DISPLAY_LABELS = {
+    "prop_su_bazlı": "Su bazlı",
+    "prop_voc_uyumlu": "VOC uyumlu",
+    "prop_kullanım_alanı": "Kullanım alanı",
+    "prop_doku": "Doku",
+    "prop_sarfiyat_min": "Sarfiyat",
+    "prop_sarfiyat_max": "Sarfiyat",
+    "prop_depolama_süresi": "Depolama süresi",
+    "prop_ambalaj_boyutları": "Ambalaj boyutları",
+}
+
+# Cues that mark a question as asking FOR a single field's value ("what
+# is X" / "is it X") rather than asking to FILTER/LIST products that
+# already have a stated value for X. Word-boundary regexes so "mi" as a
+# question particle doesn't fire on unrelated words containing "mi".
+_LOOKUP_CUE_RE = re.compile(
+    r"\bnedir\b|\bne\s*kadar\b|\bkaç\b|\bmıdır\b|\bmidir\b|\bmudur\b|\bmüdür\b"
+    r"|\bmı\b|\bmi\b|\bmu\b|\bmü\b", re.IGNORECASE)
+
+# Cues that mark a question as asking for a LIST of matching products
+# ("which ones", "show me", "list") rather than one field's value.
+_LIST_CUE_RE = re.compile(
+    r"\bhangi(leri|si)?\b|\blistele\b|\bg[öo]ster\b|\bnelerdir\b|\bneler\b",
+    re.IGNORECASE)
+
+# Cues that mark a question as an explicit product-vs-product comparison.
+_COMPARISON_CUE_RE = re.compile(
+    r"arasındaki|arasında|karşılaştır|kıyasla|\bvs\.?\b|\bcompare\b|\bfark[ıi]?\b",
+    re.IGNORECASE)
+
+
+def _detect_products(user_question):
+    """Every (filename, product_name) pair from PDF_FILES/PRODUCT_NAMES
+    whose product name literally appears in the question, in the order
+    the pairs are declared. Reused for product-filter detection,
+    comparison detection, and metadata_question's single-product case --
+    one detector instead of three copies of the same substring loop."""
+    q = user_question.lower()
+    return [(fname, name) for fname, name in zip(PDF_FILES, PRODUCT_NAMES)
+            if name.lower() in q]
+
+
+def _detect_property_keyword(user_question):
+    """First prop_ field (in _PROPERTY_KEYWORDS order) whose keyword
+    hint appears in the question, or None. Reuses the exact same
+    keyword table _requested_property_is_plausible already used to
+    sanity-check the LLM -- now it's the primary detector, not just a
+    validator."""
+    q = user_question.lower()
+    for field, keywords in _PROPERTY_KEYWORDS.items():
+        if any(kw in q for kw in keywords):
+            return field
+    return None
 
 
 def _deterministic_filters(user_question):
@@ -433,126 +492,182 @@ def _deterministic_filters(user_question):
     return filters
 
 
+# Lightweight keyword hints per lookup-able field, used to sanity-check
+# the LLM's OWN requested_property choice -- a model can name a real,
+# valid field that simply isn't what the question is asking about (e.g.
+# defaulting to prop_su_bazlı for a vague "en belirgin özelliği nedir?"
+# question -- su_bazlı is a legitimate field, just the wrong one for
+# this question). If none of a field's keywords appear anywhere in the
+# question, we don't trust the model's pick and drop it, rather than
+# answering a vague/open question with an irrelevant structured value
+# (metadata_question_lookup returning it verbatim, bypassing the LLM
+# and the actual document text entirely).
+_PROPERTY_KEYWORDS = {
+    "prop_su_bazlı": ["su bazl", "su tabanl"],
+    "prop_voc_uyumlu": ["voc"],
+    "prop_kullanım_alanı": ["kullanım alan", "iç cephe", "dış cephe", "nerede kullan"],
+    "prop_doku": ["doku", "mat", "parlak"],
+    "prop_sarfiyat_min": ["sarfiyat", "m2", "m²", "metrekare"],
+    "prop_sarfiyat_max": ["sarfiyat", "m2", "m²", "metrekare"],
+    "prop_depolama_süresi": ["depolama", "raf ömrü", "saklama"],
+    "prop_ambalaj_boyutları": ["ambalaj", "litre", "paket"],
+}
+
+
+def _requested_property_is_plausible(requested_property, user_question):
+    """False for a field name we don't even recognize, or one whose
+    keyword hints don't appear anywhere in the question."""
+    keywords = _PROPERTY_KEYWORDS.get(requested_property)
+    if not keywords:
+        return False
+    q = user_question.lower()
+    return any(kw in q for kw in keywords)
+
+
 # ---------------------------------------------------------
-# 4e-4. analyze_query -- ONE LLM call that replaces the old separate
-#     classify_intent() + rewrite_query() pair.
-#
-#     Why merge them: the two used to reason about the same question
-#     independently, in separate calls with separate prompts, and could
-#     disagree. E.g. for "su bazlı boyalar": classify_intent correctly
-#     said "metadata_list", but rewrite_query's own (separate) pass came
-#     back with an empty filters dict -> where=None. retrieve()'s
-#     `if intent == "metadata_list" and where is not None` branch
-#     requires BOTH, so it was skipped, and the question silently fell
-#     through to the semantic_qa fallback net -- not a bug in either
-#     function individually, just two independent guesses that didn't
-#     line up.
-#
-#     Fix: one call, one JSON schema. The model extracts filters /
-#     requested_property FIRST, then is explicitly told to derive
-#     "intent" from those SAME extracted fields (not re-decide it from
-#     scratch), so the two parts of the answer can no longer contradict
-#     each other.
+# 4e-3b. Minimal LLM fallback -- used ONLY when the deterministic rules
+#     in analyze_query() below genuinely can't disambiguate a question
+#     (see the two call sites there). Asks for exactly two fields, no
+#     filters, no field documentation, no examples: the deterministic
+#     filters/products already extracted stay as-is either way, this
+#     just breaks the intent/requested_property tie.
 # ---------------------------------------------------------
-def analyze_query(user_question):
-    """Returns (intent, products, search_query, where, display_property, requested_property)."""
-    system_prompt = f"""You analyze a user question for a product-datasheet search engine, in one pass. Extract filters/requested_property first, then derive "intent" from those SAME extracted fields so the two never contradict each other.
+_FALLBACK_SYSTEM_PROMPT = (
+    'Classify the product-datasheet question. Reply with ONLY minified JSON: '
+    '{"intent": "semantic_qa"|"metadata_list"|"metadata_question"|"comparison", '
+    '"requested_property": "<one prop_ field name or empty string>"}'
+)
 
-Available structured metadata fields:
-{_FILTERABLE_FIELDS}
 
-STEP 1 -- for ANY field above the question touches, decide FILTER vs LOOKUP:
-
-FILTER (goes in "filters"): the question already STATES the value for that field, and wants results matching it.
-   - "su bazlı ürünler" -> question states the value (true) for prop_su_bazlı -> filter
-   - "Momento Silan'ın ..." / "AquaLux ..." -> a named product anywhere in the question is ALWAYS a filter on prop_ürün_adı, even if the rest of the question is a lookup.
-
-LOOKUP (goes in "requested_property"): the question is ASKING for that field's value -- the value is exactly what's unknown/wanted, so it must never appear in "filters".
-   - "... depolama süresi nedir?" -> prop_depolama_süresi is unknown and wanted -> requested_property, NOT a filter
-   - "... kaç m2'ye yeter?" -> prop_sarfiyat_min/max is unknown and wanted -> requested_property
-   - "... su bazlı mı?" about ONE named product -> prop_su_bazlı is requested_property (the true/false answer is what's wanted), product name goes in filters instead.
-
-Rule of thumb: a field is a FILTER only if a concrete value for it is already given. If you'd have to guess/invent/leave it null, it's NOT a filter -- it's requested_property (or simply irrelevant).
-NEVER put a field in "filters" with value null, "", "?", or a placeholder.
-At most one field goes in "requested_property". Leave it "" if the question doesn't ask for a specific field's value.
-
-STEP 2 -- decide "intent", using ONLY the filters/requested_property you just extracted (don't re-derive them separately, don't second-guess step 1):
-- "comparison": the question names 2+ known products AND asks to compare them (e.g. "Compare AquaLux and Momento Plastix", "X ile Y arasındaki fark nedir?"). Put those exact filenames in "products".
-- "metadata_question": requested_property is set, for one specific/named product.
-- "metadata_list": filters contain at least one non-product structured field (prop_su_bazlı, prop_voc_uyumlu, prop_kullanım_alanı, prop_doku, a sarfiyat/depolama/ambalaj range, etc.) and requested_property is empty -- a find/list/filter-multiple-products question, e.g. "Hangi boyalar su bazlı?", "Mat boyaları göster.", "VOC uyumlu ürünleri listele."
-- "semantic_qa": everything else -- filters and requested_property came back empty or don't fit the cases above, or the question needs the actual document text (application instructions, surface prep, explanations, warnings, advantages/limitations, anything not represented by a structured field).
-
-Known product files:
-{PDF_FILES}
-
-Respond with ONLY minified JSON, no prose, no markdown fences, in exactly this shape:
-{{"intent": "semantic_qa"|"metadata_list"|"metadata_question"|"comparison", "products": ["<exact filename>", ...], "search_query": "<cleaned up, keyword-rich version of the question, same language as the question>", "filters": {{"field_name": value}}, "requested_property": "<one prop_ field name, or empty string>", "display_property": "<short human-readable label, same language as the question -- the requested_property if set, otherwise the main filter; empty string if neither applies>"}}
-
-Rules:
-- "products" must contain ONLY exact filenames from the known product list, and ONLY when intent is "comparison" (empty list otherwise).
-- For a numeric range like "10 m2'den az sarfiyatlı" use the operator form: {{"prop_sarfiyat_max": {{"$lte": 10}}}}.
-- If nothing is filterable, use "filters": {{}}.
-- Never return explanations or markdown.
-"""
-    user_prompt = f"User question: {user_question}"
-
+def _analyze_query_llm_fallback(user_question):
+    """Returns (intent, requested_property). Never raises -- falls back
+    to ("semantic_qa", "") on any call/parse failure, same as before."""
     try:
-        raw = ask_llm(system_prompt=system_prompt, user_prompt=user_prompt)
+        raw = ask_llm(system_prompt=_FALLBACK_SYSTEM_PROMPT, user_prompt=user_question)
         cleaned = raw.strip().strip("`")
         if cleaned[:4].lower() == "json":
             cleaned = cleaned[4:].strip()
         parsed = json.loads(cleaned)
-
         intent = parsed.get("intent")
         if intent not in ("semantic_qa", "metadata_list", "metadata_question", "comparison"):
             raise ValueError(f"unexpected intent {intent!r}")
-
-        products = [p for p in (parsed.get("products") or []) if p in PDF_FILES]
-        search_query = parsed.get("search_query") or user_question
-        filters = parsed.get("filters") or {}
-        display_property = parsed.get("display_property") or ""
         requested_property = parsed.get("requested_property") or ""
-
-        # Deterministic backstops: fill in gaps the LLM's own extraction
-        # missed. setdefault so a value the model DID get right (e.g. a
-        # numeric range, or a filter it correctly chose to leave out
-        # because it's actually the requested_property) is never
-        # overridden by these.
-        question_lower = user_question.lower()
-        if "prop_ürün_adı" not in filters:
-            for product in PRODUCT_NAMES:
-                if product.lower() in question_lower:
-                    filters["prop_ürün_adı"] = product
-                    break
-        for key, value in _deterministic_filters(user_question).items():
-            filters.setdefault(key, value)
-
-        # If the model said "semantic_qa" but a deterministic filter
-        # backstop above found something concrete AND nothing was asked
-        # as a lookup, this is actually a metadata_list question the
-        # model just missed the structured hook for (the exact failure
-        # mode that motivated this backstop) -- re-route it rather than
-        # sending a perfectly filterable question through embeddings.
-        if intent == "semantic_qa" and filters and not requested_property:
-            intent = "metadata_list"
-
+        if requested_property and not _requested_property_is_plausible(requested_property, user_question):
+            requested_property = ""
+        return intent, requested_property
     except Exception as e:
-        print(f"   [analyze_query] falling back to semantic_qa ({e})")
-        intent, products = "semantic_qa", []
-        search_query, filters, display_property, requested_property = user_question, {}, "", ""
+        print(f"   [analyze_query] LLM fallback failed, defaulting to semantic_qa ({e})")
+        return "semantic_qa", ""
 
-        # Even on a total parse/call failure, don't lose an obvious filter:
-        # deterministic detection still runs, and can upgrade the intent.
-        question_lower = user_question.lower()
-        for product in PRODUCT_NAMES:
-            if product.lower() in question_lower:
-                filters["prop_ürün_adı"] = product
-                break
-        filters.update(_deterministic_filters(user_question))
-        if filters:
-            intent = "metadata_list"
 
-    return intent, products, search_query, _filters_to_where(filters), display_property, requested_property
+# ---------------------------------------------------------
+# 4e-4. analyze_query -- deterministic-first query analysis.
+#
+#     Query rewriting is gone: `search_query` is always `user_question`,
+#     unchanged, returned only to keep the existing retrieve()/
+#     compare_all_modes() call sites unmodified.
+#
+#     Order of decisions (each one deterministic unless noted):
+#       1. Product detection (_detect_products) -- reused everywhere below.
+#       2. Comparison: 2+ products mentioned + a comparison cue. If 2+
+#          products are mentioned WITHOUT a comparison cue, that's the
+#          one genuinely ambiguous case ("mentioned together" vs "asked
+#          to compare") -- LLM fallback breaks the tie.
+#       3. Non-product filters (su_bazlı/voc_uyumlu/kullanım_alanı/doku)
+#          via the existing _deterministic_filters.
+#       4. requested_property: a property keyword is treated as a LOOKUP
+#          (metadata_question) rather than a FILTER (metadata_list) when
+#          either a single product is named (e.g. "AquaLux su bazlı
+#          mı?") or the question carries a lookup cue ("nedir"/"mı"/...)
+#          without a list cue ("hangi"/"göster"/...). This mirrors the
+#          FILTER-vs-LOOKUP distinction the old LLM prompt made, just as
+#          a rule instead of a model judgment call.
+#       5. If a property keyword is present but step 4's rule can't
+#          confidently place it (no product AND cues are absent or
+#          contradictory), that's the other ambiguous case -- LLM
+#          fallback decides.
+#       6. Otherwise: non-product filters with no requested_property ->
+#          metadata_list; nothing structured detected -> semantic_qa.
+#          Both are fully deterministic, no LLM call.
+# ---------------------------------------------------------
+def analyze_query(user_question):
+    """Returns (intent, products, search_query, where, display_property, requested_property)."""
+    search_query = user_question  # rewriting removed -- always the original text
+    products_found = _detect_products(user_question)
+    non_product_filters = _deterministic_filters(user_question)
+
+    # --- 1. Comparison -----------------------------------------------
+    if len(products_found) >= 2:
+        if _COMPARISON_CUE_RE.search(user_question):
+            products = [fname for fname, _name in products_found]
+            return "comparison", products, search_query, None, "", ""
+        # 2+ products mentioned but no explicit compare/vs/"arasında"
+        # wording -- ambiguous (could be a comparison, could just be two
+        # products named in passing). Let the minimal LLM fallback
+        # decide; deterministic filters/products stay available either way.
+        intent, requested_property = _analyze_query_llm_fallback(user_question)
+        if intent == "comparison":
+            products = [fname for fname, _name in products_found]
+            return "comparison", products, search_query, None, "", ""
+        # fall through to build filters/where for any other intent below
+    else:
+        intent, requested_property = None, None  # not yet decided
+
+    single_product = products_found[0] if len(products_found) == 1 else None
+
+    # --- 2. requested_property (LOOKUP) vs FILTER ----------------------
+    property_key = _detect_property_keyword(user_question)
+    has_lookup_cue = bool(_LOOKUP_CUE_RE.search(user_question))
+    has_list_cue = bool(_LIST_CUE_RE.search(user_question))
+
+    treat_as_lookup = property_key is not None and (
+        single_product is not None or (has_lookup_cue and not has_list_cue)
+    )
+
+    if property_key is not None and not treat_as_lookup and single_product is None \
+            and not has_list_cue and not non_product_filters:
+        # A property keyword is present but nothing (product, clear
+        # lookup cue, clear list cue, or another filter) confirms which
+        # way to read it -- genuinely ambiguous, ask the small fallback.
+        if intent is None:
+            intent, requested_property = _analyze_query_llm_fallback(user_question)
+        if intent == "metadata_question" and requested_property:
+            filters = dict(non_product_filters)
+            if single_product:
+                filters["prop_ürün_adı"] = single_product[1]
+            display_property = _PROPERTY_DISPLAY_LABELS.get(requested_property, requested_property)
+            return "metadata_question", [], search_query, _filters_to_where(filters), display_property, requested_property
+        if intent == "metadata_list" or non_product_filters:
+            filters = dict(non_product_filters)
+            if single_product:
+                filters["prop_ürün_adı"] = single_product[1]
+            display_property = _PROPERTY_DISPLAY_LABELS.get(property_key, "")
+            return "metadata_list", [], search_query, _filters_to_where(filters), display_property, ""
+        return "semantic_qa", [], search_query, None, "", ""
+
+    if treat_as_lookup:
+        filters = dict(non_product_filters)
+        filters.pop(property_key, None)  # the field being asked about is never also a filter
+        if single_product:
+            filters["prop_ürün_adı"] = single_product[1]
+        display_property = _PROPERTY_DISPLAY_LABELS.get(property_key, property_key)
+        return "metadata_question", [], search_query, _filters_to_where(filters), display_property, property_key
+
+    # --- 3. metadata_list: non-product filters present, no lookup ------
+    if non_product_filters:
+        filters = dict(non_product_filters)
+        if single_product:
+            filters["prop_ürün_adı"] = single_product[1]
+        label = _PROPERTY_DISPLAY_LABELS.get(property_key, "") if property_key else ""
+        return "metadata_list", [], search_query, _filters_to_where(filters), label, ""
+
+    # --- 4. Nothing structured detected: plain document question -------
+    # (A bare product-name mention with no other filter/property stays
+    # semantic_qa -- e.g. "AquaLux ... hangi astar önerilir?" is a
+    # genuine document question, not a list/lookup -- but the product
+    # name still narrows retrieval to that product's own chunks.)
+    filters = {"prop_ürün_adı": single_product[1]} if single_product else {}
+    return "semantic_qa", [], search_query, _filters_to_where(filters), "", ""
 
 
 def _filters_to_where(filters):
@@ -1031,7 +1146,7 @@ with the same certainty as an untagged one.
 If the excerpts contain the requested information:
 - answer clearly,
 - combine relevant excerpts when appropriate,
-- cite the page numbers.
+- cite the document.
 
 If the excerpts do not contain the requested information, reply exactly:
 
