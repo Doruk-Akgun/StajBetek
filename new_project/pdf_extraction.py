@@ -86,15 +86,7 @@ def _num(s):
     return int(val) if val.is_integer() else val
  
  
-def _range(pattern, text):
-    """Runs `pattern` (must have exactly 2 numeric capture groups) and
-    returns (min, max) as numbers, or (None, None) if no match."""
-    if not text:
-        return None, None
-    m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-    if not m:
-        return None, None
-    return _num(m.group(1)), _num(m.group(2))
+
 
 
 def _range_unit(pattern, text):
@@ -119,6 +111,86 @@ def _value_unit(pattern, text):
     if not m:
         return None, None
     return _num(m.group(1)), m.group(2).strip()
+
+
+def _percentage_interval(text):
+    """Reads a thinning percentage out of `text`. Returns (value, "%"):
+      - value is a single number, e.g. 5, when only one percentage is
+        given ("%5 inceltilerek").
+      - value is a (lo, hi) tuple, e.g. (20, 25), when the text gives a
+        range ("maksimum %20-25 inceltilerek"). This is deliberately
+        NOT labelled (lo, hi) as "min"/"max": a phrase like "maksimum
+        %20-25" means the *maximum* thinning allowed falls somewhere in
+        that 20-25 band -- 20 is not "the minimum thinning" and 25 is
+        not "the maximum thinning", they're just the two ends of one
+        interval, so both numbers are returned together as-is.
+      - value is 0 when `text` is non-empty but no percentage is found
+        at all ("Kullanıma hazırdır" / ready-to-use / must-not-be-
+        thinned wording, phrased differently across datasheets).
+      - value is None (with unit None) when `text` itself is missing.
+
+    The '%' can come BEFORE the number ("%5") just as often as after
+    ("5%"), so both orders are tried, for both the single-value and the
+    range case."""
+    if not text:
+        return None, None
+
+    # A '%' must actually be part of the match (at the start or the
+    # end) -- otherwise an unrelated "N-M" pair in the text (e.g. a
+    # drying-time range like "4-6 saat") could be mistaken for a
+    # thinning ratio just because it's nearby.
+    range_match = re.search(
+        r"%\s*(\d+(?:[.,]\d+)?)\s*[-–]\s*(\d+(?:[.,]\d+)?)\s*%?"
+        r"|(\d+(?:[.,]\d+)?)\s*[-–]\s*(\d+(?:[.,]\d+)?)\s*%", text)
+    if range_match:
+        lo = range_match.group(1) or range_match.group(3)
+        hi = range_match.group(2) or range_match.group(4)
+        return (_num(lo), _num(hi)), "%"
+
+    single_match = re.search(r"%\s*(\d+(?:[.,]\d+)?)|(\d+(?:[.,]\d+)?)\s*%", text)
+    if single_match:
+        value = _num(single_match.group(1) or single_match.group(2))
+        return value, "%"
+
+    # Text is there (we know this is a thinning-related passage), but
+    # no number anywhere in it -- ready to use / must not be thinned.
+    return 0, "%"
+
+
+def _inceltme_firca_rulo(inceltme_text):
+    """İnceltme (thinning) ratio for brush/roller application (fırça ve
+    rulo uygulaması). This lives in its own dedicated "İNCELTME"
+    section, so unlike the airless case below the whole section body
+    IS the thinning passage -- no need to anchor on the word
+    "inceltme" first (datasheets usually phrase this with verb forms
+    like "inceltilerek"/"inceltilir" rather than the noun itself, so
+    that anchor wouldn't reliably fire here anyway). Returns
+    (value, unit) -- see _percentage_interval for the shape of value.
+    (None, None) if the section itself wasn't found."""
+    return _percentage_interval(inceltme_text)
+
+
+def _inceltme_havasiz(airless_text):
+    """İnceltme (thinning) ratio for airless/spray application (havasız
+    püskürtme) -- lives inside the airless/spray section, right
+    alongside basınç/meme bilgileri. Unlike the brush/roller section,
+    this section has other numbers in it (basınç, meme ölçüsü), so we
+    anchor on the literal "inceltme" label first and only look a short
+    distance past it, to avoid picking up an unrelated number. Returns
+    (value, unit) -- see _percentage_interval for the shape of value.
+    (None, None) if the section text doesn't even mention "inceltme"."""
+    if not airless_text:
+        return None, None
+
+    mention = re.search(r"[İIiı]nceltme", airless_text)
+    if not mention:
+        return None, None
+
+    # Only look a short distance past the "inceltme" mention, so an
+    # unrelated number elsewhere in the (possibly long) airless section
+    # doesn't get mistaken for the thinning ratio.
+    window = airless_text[mention.end(): mention.end() + 200]
+    return _percentage_interval(window)
  
  
 # ---------------------------------------------------------------------------
@@ -202,7 +274,16 @@ def extract_paint_properties(pages):
     result["havasız_püskürtme_basıncı_min"] = press_min
     result["havasız_püskürtme_basıncı_max"] = press_max
     result["havasız_püskürtme_basıncı_birimi"] = press_unit
- 
+
+    inceltme_havasiz, inceltme_havasiz_birimi = _inceltme_havasiz(airless)
+    result["inceltme_havasız_püskürtme"] = inceltme_havasiz
+    result["inceltme_havasız_püskürtme_birimi"] = inceltme_havasiz_birimi
+
+    inceltme_section = _find_section(sections, "ncelt")
+    inceltme_firca_rulo, inceltme_firca_rulo_birimi = _inceltme_firca_rulo(inceltme_section)
+    result["inceltme_fırça_rulo"] = inceltme_firca_rulo
+    result["inceltme_fırça_rulo_birimi"] = inceltme_firca_rulo_birimi
+
     # --- Storage (DEPOLAMA) ---------------------------------------------
     storage = _find_section(sections, "DEPOLAMA") or sections.get("DEPOLAMA")
     shelf_val, shelf_unit = _value_unit(r"(\d+)\s*(yıl|ay|gün)", storage)
