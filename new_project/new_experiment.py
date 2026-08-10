@@ -33,7 +33,7 @@ PRODUCT_NAMES = [
 ]
 
 CHROMA_DB_PATH = "./paint_db"
-COLLECTION_NAME = "test6"
+COLLECTION_NAME = "test7"
 
 # Structured properties extracted per document during ingestion, keyed by
 # doc_id (filled in by ingest_pdf via extract_paint_properties(pages)).
@@ -409,6 +409,13 @@ _PROPERTY_DISPLAY_LABELS = {
     "prop_sarfiyat_max": "Sarfiyat",
     "prop_depolama_süresi": "Depolama süresi",
     "prop_ambalaj_boyutları": "Ambalaj boyutları",
+    "prop_dokunma_kuruması_min": "Dokunma kuruması",
+    "prop_dokunma_kuruması_max": "Dokunma kuruması",
+    "prop_katlar_arası_bekleme_min": "Katlar arası bekleme süresi",
+    "prop_katlar_arası_bekleme_max": "Katlar arası bekleme süresi",
+    "prop_son_kuruma": "Son kuruma",
+    "prop_inceltme_havasız_püskürtme": "İnceltme (havasız püskürtme)",
+    "prop_inceltme_fırça_rulo": "İnceltme (fırça/rulo)",
 }
 
 # Cues that mark a question as asking FOR a single field's value ("what
@@ -431,20 +438,61 @@ _COMPARISON_CUE_RE = re.compile(
     re.IGNORECASE)
 
 
+def normalize_product_name(text):
+    """Lowercases and strips whitespace/hyphens/underscores so 'wood-maxx',
+    'wood maxx', and 'woodmaxx' all normalize to the same token. Used by
+    _detect_products so product detection doesn't depend on the exact
+    spacing/punctuation the user happens to type."""
+    return re.sub(r"[\s\-_]+", "", text.lower())
+
+
+def _product_strip_pattern(name):
+    """Whitespace/hyphen/underscore-tolerant regex for a single product
+    name, used to remove that name from a question's text before running
+    property-keyword detection (see _detect_property_keyword /
+    _deterministic_filters). A plain str.replace(name.lower(), " ") only
+    strips an exact-spacing match, so a spacing variant like 'wood-maxx'
+    would survive stripping and could still trigger a false property
+    match the same way the unstripped literal name could."""
+    parts = re.split(r"[\s\-_]+", name.strip())
+    return re.compile(r"[\s\-_]*".join(re.escape(p) for p in parts), re.IGNORECASE)
+
+
+_PRODUCT_STRIP_PATTERNS = {name: _product_strip_pattern(name) for name in PRODUCT_NAMES}
+
+
 def _detect_products(user_question):
     """Every (filename, product_name) pair from PDF_FILES/PRODUCT_NAMES
-    whose product name literally appears in the question, in the order
-    the pairs are declared. Reused for product-filter detection,
-    comparison detection, and metadata_question's single-product case --
-    one detector instead of three copies of the same substring loop."""
-    q = user_question.lower()
+    whose product name appears in the question, ignoring differences in
+    whitespace/hyphens/underscores (e.g. 'wood-maxx', 'wood maxx', and
+    'woodmaxx' all match 'WoodMaXX Wood Stain ...'), in the order the
+    pairs are declared. Reused for product-filter detection, comparison
+    detection, and metadata_question's single-product case -- one
+    detector instead of three copies of the same substring loop."""
+    q_norm = normalize_product_name(user_question)
     return [(fname, name) for fname, name in zip(PDF_FILES, PRODUCT_NAMES)
-            if name.lower() in q]
+            if normalize_product_name(name) in q_norm]
 
 
-def _detect_property_keyword(user_question):
-    """First prop_ field (in _PROPERTY_KEYWORDS order) whose keyword
-    hint appears in the question, or None. Reuses the exact same
+_DRYING_STAGE_FIELDS = (
+    "prop_dokunma_kuruması_min",
+    "prop_katlar_arası_bekleme_min",
+    "prop_son_kuruma",
+)
+
+# Generic "does it dry / how long to dry" phrasing that doesn't name a
+# specific stage (dokunma/katlar arası/son) -- "kaç saatte kurur", "ne
+# kadar sürede kurur", "kuruma süresi nedir", "kuruyor mu". Word-boundary
+# anchored so it doesn't fire inside unrelated words like "kurumsal" or
+# "kurulum" (those have letters right after "kuru" with no boundary).
+_GENERIC_DRYING_RE = re.compile(r"\bkuru(r|ma|masi|masına|masının|yor)?\b", re.IGNORECASE)
+
+
+def _detect_property_keywords(user_question):
+    """Every prop_ field (in _PROPERTY_KEYWORDS order, deduplicated) whose
+    keyword hint appears in the question -- e.g. "sarfiyatı ve depolama
+    süresi nedir?" detects BOTH prop_sarfiyat_min/max and
+    prop_depolama_süresi, not just the first hit. Reuses the exact same
     keyword table _requested_property_is_plausible already used to
     sanity-check the LLM -- now it's the primary detector, not just a
     validator.
@@ -457,11 +505,38 @@ def _detect_property_keyword(user_question):
     metrekare boyanabilir" is a sarfiyat question, not a doku one)."""
     q = user_question.lower()
     for _fname, name in _detect_products(user_question):
-        q = q.replace(name.lower(), " ")
+        q = _PRODUCT_STRIP_PATTERNS[name].sub(" ", q)
+    found = []
     for field, keywords in _PROPERTY_KEYWORDS.items():
-        if any(kw in q for kw in keywords):
-            return field
-    return None
+        if any(_keyword_matches(kw, q) for kw in keywords) and field not in found:
+            found.append(field)
+
+    # A bare drying question ("aqualux kaç saatte kurur?") doesn't name
+    # a specific stage, so none of the three specific keyword lists
+    # above ("dokunma kuru", "katlar arası", "son kuruma") match anything
+    # -- without this, the question would fall through with zero
+    # detected properties. If no stage-specific field is already found,
+    # but the question is clearly asking about drying in general, return
+    # the full drying profile (all three stages) instead of nothing.
+    if not any(f in found for f in _DRYING_STAGE_FIELDS) and _GENERIC_DRYING_RE.search(q):
+        found.extend(_DRYING_STAGE_FIELDS)
+
+    # Range-sibling fields (e.g. prop_sarfiyat_min / prop_sarfiyat_max)
+    # share one keyword list, so a mention of "sarfiyat" matches both --
+    # but _lookup_single_property_value already merges both bounds into
+    # ONE "min-max unit" answer regardless of which sibling is asked
+    # for, so keeping both here would just print the identical merged
+    # range twice under duplicate labels. Collapse each min/max pair
+    # down to its first-seen sibling.
+    deduped = []
+    seen_roots = set()
+    for field in found:
+        root = field[:-4] if field.endswith(("_min", "_max")) else field
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+        deduped.append(field)
+    return deduped
 
 
 def _deterministic_filters(user_question):
@@ -473,7 +548,7 @@ def _deterministic_filters(user_question):
     query side and the extraction side agree on what these phrases mean.
 
     Detected product names are stripped out FIRST, same as
-    _detect_property_keyword() -- otherwise a product name that happens
+    _detect_property_keywords() -- otherwise a product name that happens
     to contain a property word (e.g. "Exxen Mat" contains "mat") gets
     misread as the user filtering/asking about that property, even when
     they're just naming the product. Without this, a broad question like
@@ -483,7 +558,7 @@ def _deterministic_filters(user_question):
     """
     q = user_question.lower()
     for _fname, name in _detect_products(user_question):
-        q = q.replace(name.lower(), " ")
+        q = _PRODUCT_STRIP_PATTERNS[name].sub(" ", q)
 
     filters = {}
 
@@ -514,16 +589,36 @@ def _deterministic_filters(user_question):
 # answering a vague/open question with an irrelevant structured value
 # (metadata_question_lookup returning it verbatim, bypassing the LLM
 # and the actual document text entirely).
+_DOKU_KEYWORD_RE = re.compile(r"doku(?!nma)")
+
 _PROPERTY_KEYWORDS = {
     "prop_su_bazlı": ["su bazl", "su tabanl"],
     "prop_voc_uyumlu": ["voc"],
     "prop_kullanım_alanı": ["kullanım alan", "iç cephe", "dış cephe", "nerede kullan"],
-    "prop_doku": ["doku", "mat", "parlak"],
+    "prop_doku": [_DOKU_KEYWORD_RE, "mat", "parlak"],
     "prop_sarfiyat_min": ["sarfiyat", "m2", "m²", "metrekare"],
     "prop_sarfiyat_max": ["sarfiyat", "m2", "m²", "metrekare"],
     "prop_depolama_süresi": ["depolama", "raf ömrü", "saklama"],
     "prop_ambalaj_boyutları": ["ambalaj", "litre", "paket"],
+    "prop_dokunma_kuruması_min": ["dokunma kuru", "dokunma kurum"],
+    "prop_dokunma_kuruması_max": ["dokunma kuru", "dokunma kurum"],
+    "prop_katlar_arası_bekleme_min": ["katlar arası", "kat arası", "katlar arasında"],
+    "prop_katlar_arası_bekleme_max": ["katlar arası", "kat arası", "katlar arasında"],
+    "prop_son_kuruma": ["son kuruma", "tam kuruma", "nihai kuruma"],
+    "prop_inceltme_havasız_püskürtme": ["havasız", "airless", "püskürtme inceltme", "inceltme havasız"],
+    "prop_inceltme_fırça_rulo": ["fırça", "rulo", "inceltme fırça", "inceltme rulo"],
 }
+
+
+def _keyword_matches(keyword, q):
+    """A keyword entry is either a plain substring (most entries -- these
+    are deliberately truncated word-stems like 'su bazl' so they also
+    catch suffix variants like 'su bazlıdır') or a compiled regex (used
+    when a plain substring would collide with an unrelated word, e.g.
+    'doku' would otherwise also match inside 'dokunma')."""
+    if hasattr(keyword, "search"):
+        return keyword.search(q) is not None
+    return keyword in q
 
 
 def _requested_property_is_plausible(requested_property, user_question):
@@ -534,8 +629,8 @@ def _requested_property_is_plausible(requested_property, user_question):
         return False
     q = user_question.lower()
     for _fname, name in _detect_products(user_question):
-        q = q.replace(name.lower(), " ")
-    return any(kw in q for kw in keywords)
+        q = _PRODUCT_STRIP_PATTERNS[name].sub(" ", q)
+    return any(_keyword_matches(kw, q) for kw in keywords)
 
 
 # ---------------------------------------------------------
@@ -589,23 +684,52 @@ def _analyze_query_llm_fallback(user_question):
 #          to compare") -- LLM fallback breaks the tie.
 #       3. Non-product filters (su_bazlı/voc_uyumlu/kullanım_alanı/doku)
 #          via the existing _deterministic_filters.
-#       4. requested_property: a property keyword is treated as a LOOKUP
-#          (metadata_question) rather than a FILTER (metadata_list) when
-#          either a single product is named (e.g. "AquaLux su bazlı
+#       4. requested_properties: property keywords are treated as a
+#          LOOKUP (metadata_question) rather than a FILTER (metadata_list)
+#          when either a single product is named (e.g. "AquaLux su bazlı
 #          mı?") or the question carries a lookup cue ("nedir"/"mı"/...)
 #          without a list cue ("hangi"/"göster"/...). This mirrors the
 #          FILTER-vs-LOOKUP distinction the old LLM prompt made, just as
-#          a rule instead of a model judgment call.
+#          a rule instead of a model judgment call. ALL property keywords
+#          found (not just the first) are carried through together, so
+#          "sarfiyatı ve depolama süresi nedir?" looks up both fields in
+#          one pass instead of only the first-matched one.
 #       5. If a property keyword is present but step 4's rule can't
 #          confidently place it (no product AND cues are absent or
 #          contradictory), that's the other ambiguous case -- LLM
-#          fallback decides.
-#       6. Otherwise: non-product filters with no requested_property ->
+#          fallback decides (still just one field; the ambiguous case is
+#          rare enough that the ~free deterministic multi-match above is
+#          left as the common path and the LLM fallback keeps its
+#          existing single-field contract).
+#       6. Otherwise: non-product filters with no requested_properties ->
 #          metadata_list; nothing structured detected -> semantic_qa.
-#          Both are fully deterministic, no LLM call.
+#          Both are fully deterministic, no LLM call. metadata_list's
+#          displayed label is built from EVERY active filter (boolean
+#          filters from _deterministic_filters plus any detected property
+#          keywords), not just one, so "su bazlı ve iç cephe olan
+#          ürünler" shows both criteria in its header instead of one.
 # ---------------------------------------------------------
+def _filters_display_label(filters, property_keys):
+    """Combined display label for metadata_list, built from every active
+    filter criterion (both the boolean/value filters in `filters` and any
+    detected property keywords not already covered), joined with ' + '.
+    'prop_ürün_adı' is excluded -- naming a product isn't a "criterion"
+    worth echoing back in the header. Falls back to "" if nothing has a
+    known display label (build_metadata_list_answer defaults that to
+    "Eşleşen")."""
+    keys = [k for k in filters if k in _PROPERTY_DISPLAY_LABELS]
+    for pk in property_keys:
+        if pk not in keys:
+            keys.append(pk)
+    labels = [_PROPERTY_DISPLAY_LABELS.get(k, k) for k in keys]
+    return " + ".join(labels)
+
+
 def analyze_query(user_question):
-    """Returns (intent, products, search_query, where, display_property, requested_property)."""
+    """Returns (intent, products, search_query, where, display_property, requested_properties).
+    `requested_properties` is always a list (possibly empty) of prop_
+    field names -- one entry for a single-field lookup, several for a
+    multi-field lookup, empty when the intent isn't a lookup at all."""
     search_query = user_question  # rewriting removed -- always the original text
     products_found = _detect_products(user_question)
     non_product_filters = _deterministic_filters(user_question)
@@ -614,66 +738,72 @@ def analyze_query(user_question):
     if len(products_found) >= 2:
         if _COMPARISON_CUE_RE.search(user_question):
             products = [fname for fname, _name in products_found]
-            return "comparison", products, search_query, None, "", ""
+            return "comparison", products, search_query, None, "", []
         # 2+ products mentioned but no explicit compare/vs/"arasında"
         # wording -- ambiguous (could be a comparison, could just be two
         # products named in passing). Let the minimal LLM fallback
         # decide; deterministic filters/products stay available either way.
-        intent, requested_property = _analyze_query_llm_fallback(user_question)
+        intent, fallback_property = _analyze_query_llm_fallback(user_question)
         if intent == "comparison":
             products = [fname for fname, _name in products_found]
-            return "comparison", products, search_query, None, "", ""
+            return "comparison", products, search_query, None, "", []
         # fall through to build filters/where for any other intent below
     else:
-        intent, requested_property = None, None  # not yet decided
+        intent, fallback_property = None, None  # not yet decided
 
     single_product = products_found[0] if len(products_found) == 1 else None
 
-    # --- 2. requested_property (LOOKUP) vs FILTER ----------------------
-    property_key = _detect_property_keyword(user_question)
+    # --- 2. requested_properties (LOOKUP) vs FILTER ---------------------
+    property_keys = _detect_property_keywords(user_question)
     has_lookup_cue = bool(_LOOKUP_CUE_RE.search(user_question))
     has_list_cue = bool(_LIST_CUE_RE.search(user_question))
 
-    treat_as_lookup = property_key is not None and (
+    treat_as_lookup = bool(property_keys) and (
         single_product is not None or (has_lookup_cue and not has_list_cue)
     )
 
-    if property_key is not None and not treat_as_lookup and single_product is None \
+    if property_keys and not treat_as_lookup and single_product is None \
             and not has_list_cue and not non_product_filters:
-        # A property keyword is present but nothing (product, clear
-        # lookup cue, clear list cue, or another filter) confirms which
-        # way to read it -- genuinely ambiguous, ask the small fallback.
+        # Property keyword(s) present but nothing (product, clear lookup
+        # cue, clear list cue, or another filter) confirms which way to
+        # read it -- genuinely ambiguous, ask the small fallback. The
+        # fallback only ever names one field; that's fine here since this
+        # branch is specifically the case where we couldn't confidently
+        # commit to ANY reading deterministically.
         if intent is None:
-            intent, requested_property = _analyze_query_llm_fallback(user_question)
-        if intent == "metadata_question" and requested_property:
+            intent, fallback_property = _analyze_query_llm_fallback(user_question)
+        if intent == "metadata_question" and fallback_property:
             filters = dict(non_product_filters)
             if single_product:
                 filters["prop_ürün_adı"] = single_product[1]
-            display_property = _PROPERTY_DISPLAY_LABELS.get(requested_property, requested_property)
-            return "metadata_question", [], search_query, _filters_to_where(filters), display_property, requested_property
+            display_property = _PROPERTY_DISPLAY_LABELS.get(fallback_property, fallback_property)
+            return "metadata_question", [], search_query, _filters_to_where(filters), display_property, [fallback_property]
         if intent == "metadata_list" or non_product_filters:
             filters = dict(non_product_filters)
             if single_product:
                 filters["prop_ürün_adı"] = single_product[1]
-            display_property = _PROPERTY_DISPLAY_LABELS.get(property_key, "")
-            return "metadata_list", [], search_query, _filters_to_where(filters), display_property, ""
-        return "semantic_qa", [], search_query, None, "", ""
+            label = _filters_display_label(filters, property_keys)
+            return "metadata_list", [], search_query, _filters_to_where(filters), label, []
+        return "semantic_qa", [], search_query, None, "", []
 
     if treat_as_lookup:
         filters = dict(non_product_filters)
-        filters.pop(property_key, None)  # the field being asked about is never also a filter
+        for pk in property_keys:
+            filters.pop(pk, None)  # a field being looked up is never also a filter
         if single_product:
             filters["prop_ürün_adı"] = single_product[1]
-        display_property = _PROPERTY_DISPLAY_LABELS.get(property_key, property_key)
-        return "metadata_question", [], search_query, _filters_to_where(filters), display_property, property_key
+        display_property = " + ".join(
+            _PROPERTY_DISPLAY_LABELS.get(pk, pk) for pk in property_keys
+        )
+        return "metadata_question", [], search_query, _filters_to_where(filters), display_property, property_keys
 
     # --- 3. metadata_list: non-product filters present, no lookup ------
     if non_product_filters:
         filters = dict(non_product_filters)
         if single_product:
             filters["prop_ürün_adı"] = single_product[1]
-        label = _PROPERTY_DISPLAY_LABELS.get(property_key, "") if property_key else ""
-        return "metadata_list", [], search_query, _filters_to_where(filters), label, ""
+        label = _filters_display_label(filters, property_keys)
+        return "metadata_list", [], search_query, _filters_to_where(filters), label, []
 
     # --- 4. Nothing structured detected: plain document question -------
     # (A bare product-name mention with no other filter/property stays
@@ -681,7 +811,7 @@ def analyze_query(user_question):
     # genuine document question, not a list/lookup -- but the product
     # name still narrows retrieval to that product's own chunks.)
     filters = {"prop_ürün_adı": single_product[1]} if single_product else {}
-    return "semantic_qa", [], search_query, _filters_to_where(filters), "", ""
+    return "semantic_qa", [], search_query, _filters_to_where(filters), "", []
 
 
 def _filters_to_where(filters):
@@ -916,21 +1046,15 @@ def build_metadata_list_answer(products, display_property):
         lines.append(f"• {product['product_name']}")
     return "\n".join(lines)
 
-def metadata_question_lookup(where, requested_property, collection):
-    """Looks up a single structured field's value for the matched
-    product. For range-shaped fields -- stored by pdf_extraction.py as
-    sibling "<root>_min" / "<root>_max" keys sharing ONE "<root>_birimi"
-    unit key (never "<root>_min_birimi") -- this strips the _min/_max
-    suffix to find the right unit key, and merges both bounds into a
-    "min-max unit" answer instead of silently returning just one
-    arbitrary bound (e.g. "prop_sarfiyat_min" alone)."""
-    if where is None or not requested_property:
-        return None
-    matched = collection.get(where=where, limit=1, include=["metadatas"])
-    if not matched["ids"]:
-        return None
-    metadata = matched["metadatas"][0]
-
+def _lookup_single_property_value(metadata, requested_property):
+    """Reads one structured field's value out of an already-fetched
+    metadata dict. For range-shaped fields -- stored by pdf_extraction.py
+    as sibling "<root>_min" / "<root>_max" keys sharing ONE
+    "<root>_birimi" unit key (never "<root>_min_birimi") -- this strips
+    the _min/_max suffix to find the right unit key, and merges both
+    bounds into a "min-max unit" answer instead of silently returning
+    just one arbitrary bound (e.g. "prop_sarfiyat_min" alone). Returns
+    None if the field has no value for this product."""
     root, bound = requested_property, None
     if root.endswith("_min"):
         root, bound = root[:-4], "min"
@@ -957,6 +1081,37 @@ def metadata_question_lookup(where, requested_property, collection):
     if unit is not None:
         return f"{value} {unit}"
     return value
+
+
+def metadata_question_lookup(where, requested_properties, collection):
+    """Looks up one or more structured fields' values for the matched
+    product and returns them as a single combined, labeled answer string
+    (one "<Label>: <value>" line per field, in the order requested) --
+    or None if the product can't be found or NONE of the requested
+    fields have a value (so the caller can fall back to
+    metadata_question_search / the LLM instead of returning an empty
+    answer). Fields that individually have no value are silently
+    skipped rather than failing the whole lookup, so "sarfiyatı ve
+    depolama süresi nedir?" still answers with whichever of the two the
+    document actually states."""
+    if where is None or not requested_properties:
+        return None
+    matched = collection.get(where=where, limit=1, include=["metadatas"])
+    if not matched["ids"]:
+        return None
+    metadata = matched["metadatas"][0]
+
+    lines = []
+    for requested_property in requested_properties:
+        value = _lookup_single_property_value(metadata, requested_property)
+        if value is None:
+            continue
+        label = _PROPERTY_DISPLAY_LABELS.get(requested_property, requested_property)
+        lines.append(f"{label}: {value}")
+
+    if not lines:
+        return None
+    return "\n".join(lines)
 
 # ---------------------------------------------------------
 # 4g-5. Strategy for "comparison": one representative PARENT chunk per
@@ -1073,7 +1228,7 @@ def build_context_generic(records):
 #     the caller must use it as-is and must NOT send it to the LLM.
 # ---------------------------------------------------------
 def retrieve(user_question, collection, parent_collection, bm25_index):
-    intent, products, search_query, where, display_property, requested_property = analyze_query(user_question)
+    intent, products, search_query, where, display_property, requested_properties = analyze_query(user_question)
     if intent == "comparison" and products:
         records = comparison_search(products, collection, parent_collection)
         context, pages = build_context_generic(records)
@@ -1094,10 +1249,12 @@ def retrieve(user_question, collection, parent_collection, bm25_index):
         ])
         return intent, context, pages, products_matched, direct_answer
 
-    if intent == "metadata_question" and requested_property:
-        value = metadata_question_lookup(where, requested_property, collection)
-        if value is not None:
-            direct_answer = f"{display_property or requested_property}: {value}"
+    if intent == "metadata_question" and requested_properties:
+        # metadata_question_lookup already returns a fully labeled answer
+        # (one "Label: value" line per requested field, multiple fields
+        # joined with newlines), so it's used as-is -- no re-wrapping.
+        direct_answer = metadata_question_lookup(where, requested_properties, collection)
+        if direct_answer is not None:
             return intent, "", [], [], direct_answer
 
     if intent == "metadata_question" and where is not None:
@@ -1265,8 +1422,8 @@ def main():
 
         print("\n--- Answer ---")
         print(answer)
-        shown_pages = sorted(set(p for p in pages if p is not None))
-        print(f"(Intent: {intent} | retrieval time: {elapsed:.3f}s | Sources: page(s) {shown_pages})\n")
+        print(f"(Intent: {intent} | retrieval time: {elapsed:.3f}s)\n")
+        print("Sources:\n")
         for r in records:
             if "metadata" in r:
                 print(r["metadata"].get("parent_id", r["id"]))
@@ -1279,7 +1436,7 @@ def main():
 def compare_all_modes(user_question, collection, parent_collection, bm25_index):
     print(f"\n=== Comparing all 4 modes for: {user_question!r} ===\n")
 
-    intent, _products, search_query, where, _display_property, _requested_property = analyze_query(user_question)
+    intent, _products, search_query, where, _display_property, _requested_properties = analyze_query(user_question)
     print(f"   [analyze] intent={intent!r} search_query={search_query!r} where={where}")
 
     results = {}

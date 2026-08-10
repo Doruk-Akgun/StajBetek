@@ -269,11 +269,10 @@ def extract_paint_properties(pages):
     airless = (_find_section(sections, "havasız")
                or _find_section(sections, "airless")
                or _find_section(sections, "püskürtme"))
-    press_min, press_max, press_unit = _range_unit(
-        r"Basınç:\s*(\d+)\s*[-–]\s*(\d+)\s*(bar|psi)", airless)
-    result["havasız_püskürtme_basıncı_min"] = press_min
-    result["havasız_püskürtme_basıncı_max"] = press_max
-    result["havasız_püskürtme_basıncı_birimi"] = press_unit
+    #press_min, press_max, press_unit = _range_unit(r"Basınç:\s*(\d+)\s*[-–]\s*(\d+)\s*(bar|psi)", airless)
+    #result["havasız_püskürtme_basıncı_min"] = press_min
+    #result["havasız_püskürtme_basıncı_max"] = press_max
+    #result["havasız_püskürtme_basıncı_birimi"] = press_unit
 
     inceltme_havasiz, inceltme_havasiz_birimi = _inceltme_havasiz(airless)
     result["inceltme_havasız_püskürtme"] = inceltme_havasiz
