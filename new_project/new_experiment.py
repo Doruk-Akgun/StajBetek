@@ -659,6 +659,14 @@ def analyze_query(user_question):
 
     single_product = products_found[0] if len(products_found) == 1 else None
 
+    if single_product is not None and _COMPARISON_CUE_RE.search(user_question):
+        # A single named product plus a comparison cue is an open comparative question,
+        # not a structured-field lookup -- single_product alone would otherwise force
+        # treat_as_lookup below. Falls to default_qa, still narrowed to
+        # this product's own chunks.
+        filters = {"prop_ürün_adı": single_product[1]}
+        return "default_qa", [], search_query, _filters_to_where(filters), "", []
+    
     # --- 2. requested_properties (LOOKUP) vs FILTER ---------------------
     property_keys = _detect_property_keywords(user_question)
     has_lookup_cue = bool(_LOOKUP_CUE_RE.search(user_question))
@@ -702,9 +710,9 @@ def analyze_query(user_question):
             _PROPERTY_DISPLAY_LABELS.get(pk, pk) for pk in property_keys
         )
         return "metadata_question", [], search_query, _filters_to_where(filters), display_property, property_keys
-
+    contains_filters = _contains_filters(user_question)
     # --- 3. metadata_list: non-product filters present, no lookup ------
-    if non_product_filters:
+    if non_product_filters or contains_filters:
         filters = dict(non_product_filters)
         if single_product:
             filters["prop_ürün_adı"] = single_product[1]
@@ -858,6 +866,28 @@ def dedupe_by_parent(records, keep_n=None):
     return deduped[:keep_n] if keep_n else deduped
 
 
+def _contains_filters(user_question):
+    """Fields needing a substring/contains match against a metadata value
+    stored as a joined list (e.g. prop_ambalaj_boyutları = "1, 5, 15")
+    rather than exact equality. Chroma's `where` can't do partial-string
+    matching on metadata, so these are applied as a local post-filter in
+    metadata_list_search, not folded into the Chroma where clause."""
+    q = user_question.lower()
+    filters = {}
+    if re.search(r"ambalaj|paket", q):
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*litre", q)
+        if m:
+            filters["prop_ambalaj_boyutları"] = m.group(1).replace(",", ".")
+    return filters
+
+
+def _meta_matches_contains(metadata, contains_filters):
+    for key, needle in contains_filters.items():
+        value = str(metadata.get(key, ""))
+        tokens = [t.strip() for t in value.split(",")]
+        if needle not in tokens:
+            return False
+    return True
 # ---------------------------------------------------------
 # 7d. Strategy for "metadata_question": NEVER runs vector similarity
 #     search. Filters are turned into a Chroma `where` clause and passed
@@ -912,16 +942,16 @@ def metadata_question_search(where, collection, parent_collection):
 #     name (metadata["prop_ürün_adı"] -- NOT source/parent_id, since one
 #     product can have many chunks) so each product appears exactly once.
 # ---------------------------------------------------------
-def metadata_list_search(where, collection):
-    if where is None:
-        return []
-
+def metadata_list_search(where, collection, user_question=None):
     matched = collection.get(where=where, include=["metadatas"])
+    contains_filters = _contains_filters(user_question) if user_question else {}
 
     by_product = {}
     for meta in matched["metadatas"]:
         product_name = meta.get("prop_ürün_adı")
         if not product_name or product_name in by_product:
+            continue
+        if contains_filters and not _meta_matches_contains(meta, contains_filters):
             continue
         by_product[product_name] = {
             "product_name": product_name,
@@ -1140,8 +1170,8 @@ def retrieve(user_question, collection, parent_collection, bm25_index):
         context, pages = build_context_generic(records)
         return intent, context, pages, records, None
 
-    if intent == "metadata_list" and where is not None:
-        products_matched = metadata_list_search(where, collection)
+    if intent == "metadata_list":
+        products_matched = metadata_list_search(where, collection, user_question)
         direct_answer = build_metadata_list_answer(products_matched, display_property)
         # context/pages are built too (for the debug print + consistent
         # return shape) but they're never handed to an LLM for this intent.
