@@ -421,6 +421,14 @@ _DRYING_STAGE_FIELDS = (
 _GENERIC_DRYING_RE = re.compile(r"\bkuru(r|ma|masi|masına|masının|yor)?\b", re.IGNORECASE)
 
 
+_THINNING_FIELDS = (
+    "prop_inceltme_havasız_püskürtme",
+    "prop_inceltme_fırça_rulo",
+)
+# Generic thinning phrasing with no application method named --
+# "ne kadar inceltilmeli", "inceltilmeli mi", "inceltme oranı".
+_GENERIC_THINNING_RE = re.compile(r"\bincelt\w*\b", re.IGNORECASE)
+
 def _detect_property_keywords(user_question):
     """Every prop_ field (in _PROPERTY_KEYWORDS order, deduplicated) whose
     keyword hint appears in the question -- e.g. "sarfiyatı ve depolama
@@ -447,12 +455,11 @@ def _detect_property_keywords(user_question):
     # A bare drying question ("aqualux kaç saatte kurur?") doesn't name
     # a specific stage, so none of the three specific keyword lists
     # above ("dokunma kuru", "katlar arası", "son kuruma") match anything
-    # -- without this, the question would fall through with zero
-    # detected properties. If no stage-specific field is already found,
-    # but the question is clearly asking about drying in general, return
-    # the full drying profile (all three stages) instead of nothing.
     if not any(f in found for f in _DRYING_STAGE_FIELDS) and _GENERIC_DRYING_RE.search(q):
         found.extend(_DRYING_STAGE_FIELDS)
+    
+    if not any(f in found for f in _THINNING_FIELDS) and _GENERIC_THINNING_RE.search(q):
+        found.extend(_THINNING_FIELDS)
 
     # Range-sibling fields (e.g. prop_sarfiyat_min / prop_sarfiyat_max)
     # share one keyword list, so a mention of "sarfiyat" matches both --
