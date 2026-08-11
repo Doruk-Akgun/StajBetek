@@ -49,8 +49,8 @@ BM25_TOP_K = 15
 FINAL_TOP_K = 5
 RRF_K = 60  # standard RRF damping constant
 
-# Confidence gating for similarity-search results (semantic / hybrid /
-# semantic_qa). Confidence is a 0..1 score derived from the retrieval
+# Confidence gating for similarity-search results (semantic / hybrid). 
+# Confidence is a 0..1 score derived from the retrieval
 # signals a record actually carries (see compute_confidence()).
 #   score <  CONFIDENCE_DROP_THRESHOLD -> discarded, never shown to the LLM
 #   score <  CONFIDENCE_LOW_THRESHOLD  -> kept, but tagged "low confidence"
@@ -61,24 +61,19 @@ RRF_K = 60  # standard RRF damping constant
 CONFIDENCE_DROP_THRESHOLD = 0.35
 CONFIDENCE_LOW_THRESHOLD = 0.55
 
-# Widened candidate pool for "semantic_qa" intent: retrieve more, then
+# Widened candidate pool for "default_qa" intent: retrieve more, then
 # collapse to one chunk per parent so a single document can't occupy
 # every slot before we even get to pick the best FINAL_TOP_K.
-SEMANTIC_QA_CANDIDATE_K = 40
+DEFAULT_QA_CANDIDATE_K = 40
 
 
 SEARCH_MODE = "hybrid_parent_child"
 
-VALID_MODES = (
-    "semantic",
-    "semantic_parent_child",
-    "hybrid",
-    "hybrid_parent_child",
-)
+
 
 
 # ---------------------------------------------------------
-# 1. LM Studio embedding function
+# 1a LM Studio embedding function
 # ---------------------------------------------------------
 def get_embedding(text):
     url = f"{LM_STUDIO_BASE_URL}/embeddings"
@@ -92,7 +87,7 @@ def get_embedding(text):
 
 
 # ---------------------------------------------------------
-# 2. LM Studio chat/completion function
+# 1b LM Studio chat/completion function
 # ---------------------------------------------------------
 def ask_llm(system_prompt, user_prompt):
     url = f"{LM_STUDIO_BASE_URL}/chat/completions"
@@ -113,7 +108,7 @@ def ask_llm(system_prompt, user_prompt):
 
 
 # ---------------------------------------------------------
-# 4. Generic character-based splitter (used for both parent and child chunks)
+# 2. Chunking
 # ---------------------------------------------------------
 def split_into_pieces(text, chunk_size, overlap):
     pieces = []
@@ -126,9 +121,6 @@ def split_into_pieces(text, chunk_size, overlap):
     return pieces
 
 
-# ---------------------------------------------------------
-# 4b. Parent-child chunking
-# ---------------------------------------------------------
 def chunk_text_parent_child(pages, doc_id):
     parent_chunks = []
     child_chunks = []
@@ -156,14 +148,7 @@ def chunk_text_parent_child(pages, doc_id):
 
 
 # ---------------------------------------------------------
-# 4a-2. Flatten the structured `properties` dict (from extract_paint_properties)
-#     into a Chroma-safe metadata dict, prefixed with "prop_" so it can't
-#     collide with the existing metadata keys (source, page_number, ...).
-#     Chroma metadata values must be str/int/float/bool -- lists are
-#     joined into a comma-separated string, and None/empty values are
-#     dropped entirely rather than stored as "None". The full dict is
-#     also kept as one JSON string (properties_json) so nothing is lost
-#     even for fields that don't round-trip cleanly through flattening.
+# 3a. Properties for ingestion
 # ---------------------------------------------------------
 def properties_to_metadata(properties):
     meta = {"properties_json": json.dumps(properties, ensure_ascii=False)}
@@ -179,9 +164,7 @@ def properties_to_metadata(properties):
 
 
 # ---------------------------------------------------------
-# 4b-2. Ingest a single PDF into an existing (possibly non-empty) collection.
-#     Safe to call multiple times with different files: parent/child ids
-#     are namespaced with doc_id so they won't collide with earlier files.
+# 3b. Ingestion
 # ---------------------------------------------------------
 def ingest_pdf(pdf_path, collection, parent_collection, pdf_file):
     doc_id = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -241,15 +224,11 @@ def ingest_pdf(pdf_path, collection, parent_collection, pdf_file):
 
 
 # ---------------------------------------------------------
-# 4c. Tokenizer for BM25 (simple, dependency-free)aaaa
+# 4. Build a BM25 index over every child chunk currently in Chroma
 # ---------------------------------------------------------
 def tokenize(text):
     return re.findall(r"[a-z0-9]+", text.lower())
 
-
-# ---------------------------------------------------------
-# 4d. Build a BM25 index over every child chunk currently in Chroma
-# ---------------------------------------------------------
 def build_bm25_index(collection):
     all_children = collection.get(include=["documents", "metadatas"])
     ids = all_children["ids"]
@@ -268,7 +247,7 @@ def build_bm25_index(collection):
 
 
 # ---------------------------------------------------------
-# 4e. Reciprocal Rank Fusion
+# 5a. Reciprocal Rank Fusion
 # ---------------------------------------------------------
 def reciprocal_rank_fusion(ranked_id_lists, k=RRF_K):
     scores = {}
@@ -280,25 +259,17 @@ def reciprocal_rank_fusion(ranked_id_lists, k=RRF_K):
 
 
 # ---------------------------------------------------------------------------
-# 4e-3. Confidence scoring -- turns whatever similarity signal a record
+# 5B. Confidence scoring -- turns whatever similarity signal a record
 #     already carries into one comparable 0..1 number, then gates on it.
 # ---------------------------------------------------------------------------
 
 def _dense_similarity(distance):
-    """Chroma cosine distance (0 = identical) -> a 0..1 similarity.
-    Clamped because a rare distance > 1 (near-opposite embeddings) would
-    otherwise produce a negative "confidence", which isn't meaningful."""
     if distance is None:
         return None
     return max(0.0, min(1.0, 1.0 - distance))
 
 
 def _normalize_sparse_scores(records):
-    """Min-max normalizes BM25 scores across the CURRENT record batch
-    into 0..1. Raw BM25 scores have no fixed scale across queries/corpora
-    (they depend on term rarity in whatever's indexed), so they can only
-    be compared relative to the other candidates retrieved this query --
-    never thresholded against an absolute number on their own."""
     scored = [(id(r), r["sparse_score"]) for r in records if r.get("sparse_score") is not None]
     if not scored:
         return {}
@@ -351,42 +322,20 @@ def compute_confidence(records):
     return records
 
 
-def apply_confidence_thresholds(records, verbose=True):
-    """Runs compute_confidence, then drops every record scored "drop".
-    "low" records are kept (they still get shown to the LLM, just
-    tagged -- see _confidence_tag) -- only records too unrelated to be
-    worth showing at all are removed here."""
+def apply_confidence_thresholds(records):
     compute_confidence(records)
     kept = [r for r in records if r["confidence_label"] != "drop"]
-    if verbose:
-        dropped = len(records) - len(kept)
-        if dropped:
-            print(f"   [confidence] dropped {dropped} chunk(s) below {CONFIDENCE_DROP_THRESHOLD} confidence")
     return kept
 
 
 def _confidence_tag(record):
-    """Short Turkish tag prepended to a source excerpt's text when its
-    confidence is "low", so answer_with_context's LLM sees the caveat
-    inline with the text it's judging -- an out-of-band field would be
-    invisible to a system prompt that only ever receives the flattened
-    context string. Records with no confidence_label (exact metadata
-    matches) or "high" get no tag."""
     if record.get("confidence_label") == "low":
-        return "[DÜŞÜK GÜVEN - bu alıntının soruyla ilişkisi zayıf olabilir] "
+        return "[DÜŞÜK GÜVEN] "
     return ""
 
 
 # ---------------------------------------------------------
-# 4e-2. Deterministic query analysis.
-#
-#     Query REWRITING has been removed entirely: retrieval (embeddings +
-#     BM25) now always uses the user's original question text, verbatim.
-#     Nothing rewrites/expands it anymore -- `search_query` below is just
-#     `user_question` passed straight through, kept as a return value
-#     only so callers (retrieve(), compare_all_modes()) don't need to
-#     change.
-#
+# 6. Deterministic query analysis.
 #     Filter/intent extraction is now deterministic-first (regex/keyword
 #     rules over the question), reusing the same _deterministic_filters /
 #     _PROPERTY_KEYWORDS helpers the old LLM-assisted version already
@@ -396,10 +345,7 @@ def _confidence_tag(record):
 #     filters, no query rewriting, no field documentation in the prompt.
 # ---------------------------------------------------------
 
-# Human-readable Turkish display label for each structured field, used
-# when a value is presented back to the user (metadata_list header,
-# metadata_question answer prefix). Mirrors what the old LLM prompt used
-# to invent on the fly via "display_property".
+
 _PROPERTY_DISPLAY_LABELS = {
     "prop_su_bazlı": "Su bazlı",
     "prop_voc_uyumlu": "VOC uyumlu",
@@ -439,10 +385,7 @@ _COMPARISON_CUE_RE = re.compile(
 
 
 def normalize_product_name(text):
-    """Lowercases and strips whitespace/hyphens/underscores so 'wood-maxx',
-    'wood maxx', and 'woodmaxx' all normalize to the same token. Used by
-    _detect_products so product detection doesn't depend on the exact
-    spacing/punctuation the user happens to type."""
+    """Lowercases and strips whitespace/hyphens/underscores"""
     return re.sub(r"[\s\-_]+", "", text.lower())
 
 
@@ -462,13 +405,6 @@ _PRODUCT_STRIP_PATTERNS = {name: _product_strip_pattern(name) for name in PRODUC
 
 
 def _detect_products(user_question):
-    """Every (filename, product_name) pair from PDF_FILES/PRODUCT_NAMES
-    whose product name appears in the question, ignoring differences in
-    whitespace/hyphens/underscores (e.g. 'wood-maxx', 'wood maxx', and
-    'woodmaxx' all match 'WoodMaXX Wood Stain ...'), in the order the
-    pairs are declared. Reused for product-filter detection, comparison
-    detection, and metadata_question's single-product case -- one
-    detector instead of three copies of the same substring loop."""
     q_norm = normalize_product_name(user_question)
     return [(fname, name) for fname, name in zip(PDF_FILES, PRODUCT_NAMES)
             if normalize_product_name(name) in q_norm]
@@ -480,11 +416,8 @@ _DRYING_STAGE_FIELDS = (
     "prop_son_kuruma",
 )
 
-# Generic "does it dry / how long to dry" phrasing that doesn't name a
-# specific stage (dokunma/katlar arası/son) -- "kaç saatte kurur", "ne
-# kadar sürede kurur", "kuruma süresi nedir", "kuruyor mu". Word-boundary
-# anchored so it doesn't fire inside unrelated words like "kurumsal" or
-# "kurulum" (those have letters right after "kuru" with no boundary).
+# Generic "does it dry / how long to dry" phrasing that doesn't name a specific stage (dokunma/katlar arası/son) 
+# "kaç saatte kurur", "ne kadar sürede kurur", "kuruma süresi nedir", "kuruyor mu".
 _GENERIC_DRYING_RE = re.compile(r"\bkuru(r|ma|masi|masına|masının|yor)?\b", re.IGNORECASE)
 
 
@@ -540,22 +473,6 @@ def _detect_property_keywords(user_question):
 
 
 def _deterministic_filters(user_question):
-    """Regex backstop for the handful of structured fields whose Turkish
-    vocabulary is small and fixed enough to detect directly, without
-    relying on the LLM at all -- mirrors the same su_bazlı/voc_uyumlu/
-    kullanım_alanı/doku regexes pdf_extraction.py already uses at
-    ingestion time to pull these same values OUT of the PDFs, so the
-    query side and the extraction side agree on what these phrases mean.
-
-    Detected product names are stripped out FIRST, same as
-    _detect_property_keywords() -- otherwise a product name that happens
-    to contain a property word (e.g. "Exxen Mat" contains "mat") gets
-    misread as the user filtering/asking about that property, even when
-    they're just naming the product. Without this, a broad question like
-    "Exxen Mat ürününün özellikleri nedir?" spuriously picks up
-    prop_doku="mat" and gets routed to metadata_list instead of
-    semantic_qa.
-    """
     q = user_question.lower()
     for _fname, name in _detect_products(user_question):
         q = _PRODUCT_STRIP_PATTERNS[name].sub(" ", q)
@@ -579,16 +496,7 @@ def _deterministic_filters(user_question):
 
     return filters
 
-# Lightweight keyword hints per lookup-able field, used to sanity-check
-# the LLM's OWN requested_property choice -- a model can name a real,
-# valid field that simply isn't what the question is asking about (e.g.
-# defaulting to prop_su_bazlı for a vague "en belirgin özelliği nedir?"
-# question -- su_bazlı is a legitimate field, just the wrong one for
-# this question). If none of a field's keywords appear anywhere in the
-# question, we don't trust the model's pick and drop it, rather than
-# answering a vague/open question with an irrelevant structured value
-# (metadata_question_lookup returning it verbatim, bypassing the LLM
-# and the actual document text entirely).
+
 _DOKU_KEYWORD_RE = re.compile(r"doku(?!nma)")
 
 _PROPERTY_KEYWORDS = {
@@ -634,7 +542,7 @@ def _requested_property_is_plausible(requested_property, user_question):
 
 
 # ---------------------------------------------------------
-# 4e-3b. Minimal LLM fallback -- used ONLY when the deterministic rules
+# 6b. Minimal LLM fallback -- used ONLY when the deterministic rules
 #     in analyze_query() below genuinely can't disambiguate a question
 #     (see the two call sites there). Asks for exactly two fields, no
 #     filters, no field documentation, no examples: the deterministic
@@ -643,14 +551,14 @@ def _requested_property_is_plausible(requested_property, user_question):
 # ---------------------------------------------------------
 _FALLBACK_SYSTEM_PROMPT = (
     'Classify the product-datasheet question. Reply with ONLY minified JSON: '
-    '{"intent": "semantic_qa"|"metadata_list"|"metadata_question"|"comparison", '
+    '{"intent": "default_qa"|"metadata_list"|"metadata_question"|"comparison", '
     '"requested_property": "<one prop_ field name or empty string>"}'
 )
 
 
 def _analyze_query_llm_fallback(user_question):
     """Returns (intent, requested_property). Never raises -- falls back
-    to ("semantic_qa", "") on any call/parse failure, same as before."""
+    to ("default_qa", "") on any call/parse failure, same as before."""
     try:
         raw = ask_llm(system_prompt=_FALLBACK_SYSTEM_PROMPT, user_prompt=user_question)
         cleaned = raw.strip().strip("`")
@@ -658,23 +566,20 @@ def _analyze_query_llm_fallback(user_question):
             cleaned = cleaned[4:].strip()
         parsed = json.loads(cleaned)
         intent = parsed.get("intent")
-        if intent not in ("semantic_qa", "metadata_list", "metadata_question", "comparison"):
+        if intent not in ("default_qa", "metadata_list", "metadata_question", "comparison"):
             raise ValueError(f"unexpected intent {intent!r}")
         requested_property = parsed.get("requested_property") or ""
         if requested_property and not _requested_property_is_plausible(requested_property, user_question):
             requested_property = ""
         return intent, requested_property
     except Exception as e:
-        print(f"   [analyze_query] LLM fallback failed, defaulting to semantic_qa ({e})")
-        return "semantic_qa", ""
+        print(f"   [analyze_query] LLM fallback failed, defaulting to default_qa ({e})")
+        return "default_qa", ""
 
 
 # ---------------------------------------------------------
-# 4e-4. analyze_query -- deterministic-first query analysis.
+# 6c. analyze_query -- deterministic-first query analysis.
 #
-#     Query rewriting is gone: `search_query` is always `user_question`,
-#     unchanged, returned only to keep the existing retrieve()/
-#     compare_all_modes() call sites unmodified.
 #
 #     Order of decisions (each one deterministic unless noted):
 #       1. Product detection (_detect_products) -- reused everywhere below.
@@ -688,12 +593,7 @@ def _analyze_query_llm_fallback(user_question):
 #          LOOKUP (metadata_question) rather than a FILTER (metadata_list)
 #          when either a single product is named (e.g. "AquaLux su bazlı
 #          mı?") or the question carries a lookup cue ("nedir"/"mı"/...)
-#          without a list cue ("hangi"/"göster"/...). This mirrors the
-#          FILTER-vs-LOOKUP distinction the old LLM prompt made, just as
-#          a rule instead of a model judgment call. ALL property keywords
-#          found (not just the first) are carried through together, so
-#          "sarfiyatı ve depolama süresi nedir?" looks up both fields in
-#          one pass instead of only the first-matched one.
+#          without a list cue ("hangi"/"göster"/...).
 #       5. If a property keyword is present but step 4's rule can't
 #          confidently place it (no product AND cues are absent or
 #          contradictory), that's the other ambiguous case -- LLM
@@ -702,12 +602,11 @@ def _analyze_query_llm_fallback(user_question):
 #          left as the common path and the LLM fallback keeps its
 #          existing single-field contract).
 #       6. Otherwise: non-product filters with no requested_properties ->
-#          metadata_list; nothing structured detected -> semantic_qa.
+#          metadata_list; nothing structured detected -> default_qa.
 #          Both are fully deterministic, no LLM call. metadata_list's
 #          displayed label is built from EVERY active filter (boolean
 #          filters from _deterministic_filters plus any detected property
-#          keywords), not just one, so "su bazlı ve iç cephe olan
-#          ürünler" shows both criteria in its header instead of one.
+#          keywords)
 # ---------------------------------------------------------
 def _filters_display_label(filters, property_keys):
     """Combined display label for metadata_list, built from every active
@@ -784,7 +683,7 @@ def analyze_query(user_question):
                 filters["prop_ürün_adı"] = single_product[1]
             label = _filters_display_label(filters, property_keys)
             return "metadata_list", [], search_query, _filters_to_where(filters), label, []
-        return "semantic_qa", [], search_query, None, "", []
+        return "default_qa", [], search_query, None, "", []
 
     if treat_as_lookup:
         filters = dict(non_product_filters)
@@ -807,11 +706,11 @@ def analyze_query(user_question):
 
     # --- 4. Nothing structured detected: plain document question -------
     # (A bare product-name mention with no other filter/property stays
-    # semantic_qa -- e.g. "AquaLux ... hangi astar önerilir?" is a
+    # default_qa -- e.g. "AquaLux ... hangi astar önerilir?" is a
     # genuine document question, not a list/lookup -- but the product
     # name still narrows retrieval to that product's own chunks.)
     filters = {"prop_ürün_adı": single_product[1]} if single_product else {}
-    return "semantic_qa", [], search_query, _filters_to_where(filters), "", []
+    return "default_qa", [], search_query, _filters_to_where(filters), "", []
 
 
 def _filters_to_where(filters):
@@ -863,7 +762,7 @@ def _record_matches_where(metadata, where):
 
 
 # ---------------------------------------------------------
-# 4f. Retrieval mode: semantic-only (dense vector) search.
+# 7a. Retrieval mode: semantic-only (dense vector) search.
 #     Returns a ranked list of {"id", "text", "metadata"} records.
 # ---------------------------------------------------------
 def semantic_search(user_question, collection, final_n=FINAL_TOP_K, where=None):
@@ -882,7 +781,7 @@ def semantic_search(user_question, collection, final_n=FINAL_TOP_K, where=None):
 
 
 # ---------------------------------------------------------
-# 4g. Retrieval mode: hybrid (vector + BM25, fused with RRF).
+# 7b. Retrieval mode: hybrid (vector + BM25, fused with RRF).
 #     Returns a ranked list of {"id", "text", "metadata"} records.
 # ---------------------------------------------------------
 def hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K, where=None,
@@ -933,7 +832,7 @@ def hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K, wh
 
 
 # ---------------------------------------------------------
-# 4g-3. Strategy for "semantic_qa": keep hybrid retrieval, but widen the
+# 7c. Strategy for "default_qa": keep hybrid retrieval, but widen the
 #     candidate pool and then collapse to ONE (highest-ranked) chunk per
 #     parent, so one document's many chunks can't crowd out others.
 # ---------------------------------------------------------
@@ -953,7 +852,7 @@ def dedupe_by_parent(records, keep_n=None):
 
 
 # ---------------------------------------------------------
-# 4g-4. Strategy for "metadata_question": NEVER runs vector similarity
+# 7d. Strategy for "metadata_question": NEVER runs vector similarity
 #     search. Filters are turned into a Chroma `where` clause and passed
 #     to collection.get(...), which returns every matching child chunk
 #     with no ranking/truncation involved. Then we deduplicate down to
@@ -995,7 +894,7 @@ def metadata_question_search(where, collection, parent_collection):
 
 
 # ---------------------------------------------------------
-# 4g-4b. Strategy for "metadata_list": a pure structured-database lookup.
+# 7e. Strategy for "metadata_list": a pure structured-database lookup.
 #     NEVER calls collection.query(), NEVER generates embeddings, NEVER
 #     runs BM25, and NEVER expands to parent chunks -- listing questions
 #     ("Hangi boyalar su bazlıdır?") aren't nearest-neighbor questions or
@@ -1027,7 +926,7 @@ def metadata_list_search(where, collection):
 
 
 # ---------------------------------------------------------
-# 4g-4c. Generic answer formatter for "metadata_list". Never sent through
+# 7e. Generic answer formatter for "metadata_list". Never sent through
 #     the LLM and never hardcodes a property name -- the metadata database
 #     already contains the answer, so we just render it directly.
 #
@@ -1114,7 +1013,7 @@ def metadata_question_lookup(where, requested_properties, collection):
     return "\n".join(lines)
 
 # ---------------------------------------------------------
-# 4g-5. Strategy for "comparison": one representative PARENT chunk per
+# 7f. Strategy for "comparison": one representative PARENT chunk per
 #     referenced product, fetched directly by `source` -- no nearest-
 #     neighbor ranking involved, so every named product is guaranteed a
 #     slot instead of competing for it.
@@ -1137,7 +1036,7 @@ def comparison_search(products, collection, parent_collection):
 
 
 # ---------------------------------------------------------
-# 4h. Context builder A: "flat" — use the matched CHILD chunk text
+# 8a. Context builder A: "flat" — use the matched CHILD chunk text
 #     directly as context (no parent expansion).
 # ---------------------------------------------------------
 def build_context(records):
@@ -1163,7 +1062,7 @@ def build_context(records):
 
 
 # ---------------------------------------------------------
-# 4i. Context builder B: "parent_child" — expand matched child chunks
+# 8b. Context builder B: "parent_child" — expand matched child chunks
 #     up to their PARENT chunk text as context.
 # ---------------------------------------------------------
 def build_context_parent_child(records, parent_collection):
@@ -1203,9 +1102,9 @@ def build_context_parent_child(records, parent_collection):
 
 
 # ---------------------------------------------------------
-# 4i-2. Context builder C: "generic" -- for records that are already the
+# 8c. Context builder C: "generic" -- for records that are already the
 #     final thing to show (parent chunks from metadata_question/comparison,
-#     or deduped child chunks from semantic_qa). No parent expansion,
+#     or deduped child chunks from default_qa). No parent expansion,
 #     no dense/sparse score assumptions.
 # ---------------------------------------------------------
 def build_context_generic(records):
@@ -1218,7 +1117,7 @@ def build_context_generic(records):
 
 
 # ---------------------------------------------------------
-# 4i-3. Intent-routed retrieval entry point. Classifies the question
+# 9a. Intent-routed retrieval entry point. Classifies the question
 #     first, THEN picks the retrieval strategy that actually fits it --
 #     this is what replaces "always run vector search" as the default.
 #
@@ -1262,14 +1161,12 @@ def retrieve(user_question, collection, parent_collection, bm25_index):
         context, pages = build_context_generic(records)
         return intent, context, pages, records, None
 
-    # Fallback net: "comparison" with no products matched, or
-    # "metadata_list"/"metadata_question" with no extractable filter,
-    # all degrade to semantic_qa rather than returning empty-handed.
-    intent = "semantic_qa"
+    # Fallback to default_qa
+    intent = "default_qa"
     records = hybrid_search(
         search_query, collection, bm25_index,
-        final_n=SEMANTIC_QA_CANDIDATE_K, where=where,
-        vector_top_k=SEMANTIC_QA_CANDIDATE_K, bm25_top_k=SEMANTIC_QA_CANDIDATE_K,
+        final_n=DEFAULT_QA_CANDIDATE_K, where=where,
+        vector_top_k=DEFAULT_QA_CANDIDATE_K, bm25_top_k=DEFAULT_QA_CANDIDATE_K,
     )
     # Gate on confidence BEFORE dedupe/truncation, over the wide
     # candidate pool -- so a dropped low-confidence chunk simply lets
@@ -1280,44 +1177,10 @@ def retrieve(user_question, collection, parent_collection, bm25_index):
     context, pages = build_context_parent_child(records, parent_collection)
     return intent, context, pages, records, None
 
-
 # ---------------------------------------------------------
-# 4j. Mode dispatch (switch/case via match statement).
-#     Runs the right retriever + the right context builder for a mode
-#     and returns (context, pages, records, elapsed_seconds).
+# 9b. LLM call for default RAG process. If direct_answer == None
+#     then it directs here.
 # ---------------------------------------------------------
-def run_mode(mode, user_question, collection, parent_collection, bm25_index, where=None):
-    start = time.perf_counter()
-
-    match mode:
-        case "semantic":
-            records = semantic_search(user_question, collection, final_n=FINAL_TOP_K, where=where)
-            records = apply_confidence_thresholds(records)
-            context, pages = build_context(records)
-
-        case "semantic_parent_child":
-            records = semantic_search(user_question, collection, final_n=FINAL_TOP_K, where=where)
-            records = apply_confidence_thresholds(records)
-            context, pages = build_context_parent_child(records, parent_collection)
-
-        case "hybrid":
-            records = hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K, where=where)
-            records = apply_confidence_thresholds(records)
-            context, pages = build_context(records)
-
-        case "hybrid_parent_child":
-            records = hybrid_search(user_question, collection, bm25_index, final_n=FINAL_TOP_K, where=where)
-            records = apply_confidence_thresholds(records)
-            context, pages = build_context_parent_child(records, parent_collection)
-
-        case _:
-            raise ValueError(f"Unknown SEARCH_MODE: {mode!r}. Valid modes: {VALID_MODES}")
-
-    elapsed = time.perf_counter() - start
-    
-    return context, pages, records, elapsed
-
-
 def answer_with_context(user_question, context):
     system_prompt = f"""You are a document assistant.
 
@@ -1366,7 +1229,7 @@ Respond according to the system instructions.
 
 
 # ---------------------------------------------------------
-# 5. Store in Chroma DB and run the RAG query loop
+# 10. Store in Chroma DB and run the RAG query loop
 # ---------------------------------------------------------
 def main():
     print("Step 1: Setting up Chroma DB...")
@@ -1389,13 +1252,12 @@ def main():
 
     print(f"Collection now has {collection.count()} child chunks and {parent_collection.count()} parent chunks in '{COLLECTION_NAME}'.\n")
 
-    print("Step 5: Building BM25 keyword index over child chunks...")
+    print("Step 3: Building BM25 keyword index over child chunks...")
     bm25_index = build_bm25_index(collection)
     print(f"   BM25 index built over {len(bm25_index['ids'])} child chunks.\n")
 
     print(f"Active SEARCH_MODE: {SEARCH_MODE}")
-    print("Ready! Ask questions about the paper (type 'exit'/'quit' to stop).")
-    print("Prefix a question with '/compare ' to run ALL 4 modes on it and compare.\n")
+    print("Ready! Ask questions about the documents (type 'exit'/'quit' to stop).")
 
     while True:
         raw_input_text = input("Your question: ").strip()
@@ -1403,10 +1265,6 @@ def main():
             print("Ending session.")
             break
 
-        if raw_input_text.lower().startswith("/compare "):
-            user_question = raw_input_text[len("/compare "):].strip()
-            compare_all_modes(user_question, collection, parent_collection, bm25_index)
-            continue
 
         user_question = raw_input_text
         start = time.perf_counter()
@@ -1430,37 +1288,6 @@ def main():
             else:
                 print(r.get("product_name"))
 
-# ---------------------------------------------------------
-# 6. Compare all 4 modes side by side on the same question
-# ---------------------------------------------------------
-def compare_all_modes(user_question, collection, parent_collection, bm25_index):
-    print(f"\n=== Comparing all 4 modes for: {user_question!r} ===\n")
-
-    intent, _products, search_query, where, _display_property, _requested_properties = analyze_query(user_question)
-    print(f"   [analyze] intent={intent!r} search_query={search_query!r} where={where}")
-
-    results = {}
-    for mode in VALID_MODES:
-        context, pages, records, elapsed = run_mode(
-            mode, search_query, collection, parent_collection, bm25_index, where=where
-        )
-        answer = answer_with_context(user_question, context)
-        results[mode] = {
-            "context": context,
-            "pages": sorted(set(pages)),
-            "num_chunks": len(records),
-            "elapsed": elapsed,
-            "answer": answer,
-        }
-
-    for mode in VALID_MODES:
-        r = results[mode]
-        print(f"--- {mode} ---")
-        print(f"retrieval time: {r['elapsed']:.3f}s | chunks used: {r['num_chunks']} | pages: {r['pages']}")
-        print(f"answer: {r['answer']}")
-        print()
-
-    print("=== End comparison ===\n")
 
 
 if __name__ == "__main__":
