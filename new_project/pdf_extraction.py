@@ -245,7 +245,7 @@ def extract_paint_properties(pages):
         result["katlar_arası_bekleme_birimi"] = recoat_unit
  
         cure_val, cure_unit = _value_unit(
-            r"Son Kuruma:\s*(\d+)\s*(dakika|saat|gün)", drying)
+            r"(?:Son|Sert)\s*Kuruma(?:sı)?\s*:\s*(\d+)\s*(dakika|saat|gün)", drying)
         result["son_kuruma"] = cure_val
         result["son_kuruma_birimi"] = cure_unit
 

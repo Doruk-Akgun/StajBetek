@@ -44,8 +44,8 @@ PARENT_OVERLAP = 128
 CHILD_CHUNK_SIZE = 256
 CHILD_OVERLAP = 32
 
-VECTOR_TOP_K = 15
-BM25_TOP_K = 15
+VECTOR_TOP_K = 15 # Not being used rn
+BM25_TOP_K = 15 # Not being used rn
 FINAL_TOP_K = 5
 RRF_K = 60  # standard RRF damping constant
 
@@ -61,9 +61,7 @@ RRF_K = 60  # standard RRF damping constant
 CONFIDENCE_DROP_THRESHOLD = 0.35
 CONFIDENCE_LOW_THRESHOLD = 0.55
 
-# Widened candidate pool for "default_qa" intent: retrieve more, then
-# collapse to one chunk per parent so a single document can't occupy
-# every slot before we even get to pick the best FINAL_TOP_K.
+# Widened candidate pool for "default_qa"
 DEFAULT_QA_CANDIDATE_K = 40
 
 
@@ -108,7 +106,7 @@ def ask_llm(system_prompt, user_prompt):
 
 
 # ---------------------------------------------------------
-# 2. Chunking
+# 2a. Splitting for chunking
 # ---------------------------------------------------------
 def split_into_pieces(text, chunk_size, overlap):
     pieces = []
@@ -120,7 +118,9 @@ def split_into_pieces(text, chunk_size, overlap):
         i += chunk_size - overlap
     return pieces
 
-
+# ---------------------------------------------------------
+# 2b. Parent-Child  chunking
+# ---------------------------------------------------------
 def chunk_text_parent_child(pages, doc_id):
     parent_chunks = []
     child_chunks = []
