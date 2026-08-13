@@ -33,7 +33,7 @@ PRODUCT_NAMES = [
 ]
 
 CHROMA_DB_PATH = "./paint_db"
-COLLECTION_NAME = "test7"
+COLLECTION_NAME = "test8"
 
 # Structured properties extracted per document during ingestion, keyed by
 # doc_id (filled in by ingest_pdf via extract_paint_properties(pages)).
@@ -67,7 +67,9 @@ DEFAULT_QA_CANDIDATE_K = 40
 
 SEARCH_MODE = "hybrid_parent_child"
 
-
+PRODUCT_ALIASES = {
+    "WoodMaXX Wood Stain Dekoratif Ahşap Verniği": ["WoodMaXX Wood Stain", "WoodMaXX"],
+}
 
 
 # ---------------------------------------------------------
@@ -406,8 +408,12 @@ _PRODUCT_STRIP_PATTERNS = {name: _product_strip_pattern(name) for name in PRODUC
 
 def _detect_products(user_question):
     q_norm = normalize_product_name(user_question)
-    return [(fname, name) for fname, name in zip(PDF_FILES, PRODUCT_NAMES)
-            if normalize_product_name(name) in q_norm]
+    found = []
+    for fname, name in zip(PDF_FILES, PRODUCT_NAMES):
+        candidates = [name] + PRODUCT_ALIASES.get(name, [])
+        if any(normalize_product_name(c) in q_norm for c in candidates):
+            found.append((fname, name))
+    return found
 
 
 _DRYING_STAGE_FIELDS = (
