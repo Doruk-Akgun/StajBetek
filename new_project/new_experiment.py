@@ -97,7 +97,7 @@ def ask_llm(system_prompt, user_prompt):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.3,
+        "temperature": 0.2,
     }
     response = requests.post(url, headers=headers, data=json.dumps(data))
     if response.status_code != 200:
@@ -326,7 +326,12 @@ def compute_confidence(records):
 
 def apply_confidence_thresholds(records):
     compute_confidence(records)
+    max_conf = max((r["confidence"] for r in records), default=None)
+    print("Max confidence:", max_conf)
     kept = [r for r in records if r["confidence_label"] != "drop"]
+    high = [r for r in records if r["confidence_label"] == "high"]
+    print("Number of kept chunks:", len(kept))
+    print("Number of high confidence chunks:", len(high))
     return kept
 
 
