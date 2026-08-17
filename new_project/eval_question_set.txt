@@ -1,0 +1,50 @@
+AquaLux ne kadar inceltilmeli?
+AquaLux hangi yüzeylerde kullanılabilir?
+AquaLux'u uygulamadan önce hangi astar kullanılmalıdır?
+AquaLux zeminde kullanılabilir mi?
+Exxen Mat kaç metrekare alan boyar?
+Exxen Mat kaç kat uygulanmalıdır?
+Momento Plastix hangi yüzeyler için uygundur?problem=extra unnecessary information
+Momento Plastix'in diğer iç cephe boyalarından farkı nedir? problem=too general/cannot compare with everything
+Momento Silan'ın en önemli özelliği nedir?
+Momento Silan gerçekten silinebilir mi?
+Momento Silan hangi astarla uygulanmalıdır?
+WoodMaXX Wood Stain inceltilmeli mi?
+WoodMaXX Wood Stain dış mekanda kullanılabilir mi?
+WoodMaXX Wood Stain kaç kat uygulanmalıdır?
+AquaLux ile Momento Silan arasındaki temel fark nedir?
+Hangi ürünler su bazlıdır?
+Hangi ürünler VOC uyumludur?
+İpeksi mat görünüme sahip ürün hangisidir?
+Hangi ürünler 15 litrelik ambalaj seçeneğine sahiptir?
+Ahşap bir yüzeyi boyamadan önce hangi hazırlık işlemleri yapılmalıdır?
+Aqua lux VOC uyumlu mudur?
+AquaLux'un özelliği nedir?
+AquaLux neden tercih edilmeli?
+AquaLux su bazlı mıdır ve kaç saatte kurur?
+Su bazlı ve mat ürünler hangileri?
+AquaLux ile Momento Silan hangisi daha uygun?
+
+
+
+AquaLux'un sarfiyatı ve depolama süresi nedir?
+Momento Silan su bazlı mı ve kaç saatte kurur?
+WoodMaXX Wood Stain'in kuruma süresi ve ambalaj boyutları nedir?
+Exxen Mat kaç saatte kurur?
+Momento Plastix inceltilmeli mi?
+Exxen Mat kaç metrekare alan boyar?
+Exxen Mat parlak mı yoksa mat mı?
+İç cephede kullanılabilecek su bazlı ürünler hangileri?
+Su bazlı ve VOC uyumlu ürünler hangileri?
+Hangi ürünler 5 litrelik ambalaj seçeneğine sahiptir?
+Sarfiyat hakkında bilgi verir misin? problem only 2 products returned 
+İnceltme oranları nasıl?
+AquaLux'un diğer ürünlerden farkı nedir?
+Momento Silan ile diğer astarlar arasındaki fark nedir? problem
+AquaLux ve Momento Silan hakkında bilgi verir misin?
+Dulux Weathershield'ın özellikleri nelerdir?
+Sarfiyatı 10 m²'den fazla olan ürünler hangileri? problem = default_qa and top 5 chunk has 4 products so 1 products gets left out
+AquaLux, Exxen Mat ve Momento Silan arasındaki farklar nelerdir?
+
+Momento Silan hangi teknoloji ile geliştirilmiştir?
+WoodMaXX Wood Stain hangi yüzeyler için geliştirilmiştir?
